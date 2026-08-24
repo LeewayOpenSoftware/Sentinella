@@ -24,11 +24,12 @@
 //!
 //! # Reload
 //!
-//! There is no live list reload: `service.rs` loads blocklists once, at
-//! startup (`load_lists`), and exposes no reload signal. A freshly
-//! installed list therefore takes effect at the next daemon start. The
-//! [`RefreshReport`] returned here carries whether anything changed so a
-//! future reload signal has something to key on.
+//! A refreshed list takes effect WITHOUT a daemon restart: the update-cycle
+//! call site (`ipc::state::start_update`) keys on [`RefreshReport::changed`]
+//! and swaps the proxy's whole filter engine through the
+//! `Arc<RwLock<FilterEngine>>` the serving loops read per query — see
+//! `service.rs::apply_refresh_report`. This module stays pure I/O: it
+//! rewrites files and reports what changed; the swap lives with the caller.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -63,8 +64,8 @@ pub fn managed_dir(root: &Path) -> PathBuf {
     root.join("rules").join("dns").join("managed")
 }
 
-/// What one refresh cycle did. `changed` is the signal a future live
-/// reload would key on; today nothing consumes it (see the module docs).
+/// What one refresh cycle did. `changed` keys the live engine swap at the
+/// update-cycle call site (`service.rs::apply_refresh_report`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshReport {
     /// A validated new list was installed over (or instead of) the old.
@@ -77,15 +78,13 @@ pub struct RefreshReport {
 /// success/failure channel: every error is a `warn!` here, because the
 /// failure mode of this function is "filtering runs on yesterday's list",
 /// which the next cycle retries.
-pub fn refresh_on_update_cycle() {
+///
+/// Returns the report so the caller can swap the refreshed lists into the
+/// running proxy on `changed` (`service.rs::apply_refresh_report`); this
+/// function itself stays pure fetch-and-install.
+pub fn refresh_on_update_cycle() -> RefreshReport {
     let root = crate::paths::paths().root().to_path_buf();
-    let report = refresh_managed_lists(&root);
-    if report.changed {
-        // Until service.rs grows a reload signal this is startup-only
-        // content; say so in the log rather than letting "installed" read
-        // as "in force".
-        info!("web protection: managed blocklist updated — takes effect at the next daemon start");
-    }
+    refresh_managed_lists(&root)
 }
 
 /// Refresh every managed feed into `managed_dir(root)`. Failures are

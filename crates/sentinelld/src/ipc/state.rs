@@ -4575,7 +4575,33 @@ impl AppState {
             // failed. It only rewrites files under rules\dns\managed — on
             // any error the previous list stays in force; it cannot disable
             // filtering or touch the proxy/NRPT.
-            crate::web_protection::lists::refresh_on_update_cycle();
+            let report = crate::web_protection::lists::refresh_on_update_cycle();
+
+            // A CHANGED list takes effect NOW, not at the next daemon start:
+            // swap the proxy's whole filter engine through the shared
+            // Arc<RwLock>. The serving loop takes engine.read() per query and
+            // decide() runs before the cache lookup, so the next query already
+            // filters with the new rules; the writer only waits out in-flight
+            // decisions, never upstream exchanges. The engine is rebuilt from
+            // the BOOT config (never a disk re-read) with the canary intact —
+            // the invariants and the why live in
+            // web_protection::service::apply_refresh_report. A swap can only
+            // ever reduce to warn-and-skip per list, i.e. less filtering,
+            // never no DNS.
+            let wp_handle = state
+                .web_protection
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(handle) = wp_handle
+                && let Some(rules) =
+                    crate::web_protection::service::apply_refresh_report(&handle, report)
+            {
+                tracing::info!(
+                    rules_added = rules,
+                    "web protection: refreshed blocklist in force — filter engine swapped live, no restart"
+                );
+            }
 
             // Mark update as done.
             {

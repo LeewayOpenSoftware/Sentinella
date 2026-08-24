@@ -95,9 +95,33 @@ pub struct WebProtectionHandle {
     /// The watchdog's live health facts (degraded upstreams, fired),
     /// present while the watchdog runs.
     watchdog: Option<Arc<RwLock<WatchdogState>>>,
+    /// The BOOT config, kept so a refreshed blocklist can rebuild the
+    /// engine live. Reloads use THIS, never a fresh disk read: the on-disk
+    /// section may carry allowlist/blocklists edits the wire protocol
+    /// classifies as DaemonRestart, and hot-applying those here would be
+    /// half a restart (split-brain — the hazard full_config.rs warns about).
+    /// `None` on handles that never started (disabled/refused), which have
+    /// no engine to rebuild into either.
+    boot_config: Option<WebProtectionConfig>,
 }
 
 impl WebProtectionHandle {
+    /// The proxy's shared engine slot, when one exists (serving, or a
+    /// self-test-failed start that kept the engine for status). A
+    /// whole-engine swap under this write lock is live on the NEXT query —
+    /// the serving loop takes `engine.read()` per query and `decide` runs
+    /// before the cache lookup — so a refreshed blocklist takes effect with
+    /// no listener restart and no dnsguard change.
+    pub fn engine_handle(&self) -> Option<Arc<RwLock<FilterEngine>>> {
+        self.engine.clone()
+    }
+
+    /// The config the running engine was built from. Live reloads MUST
+    /// rebuild from this boot-time copy, never from disk — see the field.
+    pub fn boot_config(&self) -> Option<&WebProtectionConfig> {
+        self.boot_config.as_ref()
+    }
+
     /// A point-in-time status, reading live counters when serving.
     pub fn status(&self) -> WebProtectionStatus {
         let snap = self.counters.as_ref().map(|c| c.snapshot());
@@ -327,6 +351,7 @@ impl WebProtection {
                 rule_guid: None,
                 upstreams_handle: None,
                 watchdog: None,
+                boot_config: None,
             }),
             refusal,
             watchdog: None,
@@ -458,6 +483,7 @@ impl WebProtection {
                     rule_guid: None,
                     upstreams_handle: None,
                     watchdog: None,
+                    boot_config: Some(cfg.clone()),
                 }),
                 refusal: Some(classify_self_test(&report)),
                 watchdog: None,
@@ -534,6 +560,7 @@ impl WebProtection {
                 rule_guid,
                 upstreams_handle: Some(upstreams_handle),
                 watchdog: watchdog_state,
+                boot_config: Some(cfg.clone()),
             }),
             refusal: None,
             watchdog,
@@ -733,12 +760,53 @@ pub async fn spawn_retry(
     Some(RetryGuard { flag, wake, task })
 }
 
+/// Apply a finished update-cycle list refresh to the RUNNING proxy: when
+/// the refresh CHANGED the managed lists, rebuild the filter engine from
+/// the BOOT config and swap it in whole. Returns `Some(rules_loaded)` on a
+/// swap, `None` when nothing was done — an unchanged refresh, or no engine
+/// slot (disabled/refused starts have nothing serving to swap into).
+///
+/// WHY A WHOLE-ENGINE SWAP NEEDS NO RESTART. The serving loops take
+/// `engine.read()` per query (dnsguard `proxy.rs`) and `decide` runs BEFORE
+/// the cache lookup, so the swapped engine filters the very next query —
+/// block answers are synthesized pre-cache and never cached, so there is no
+/// stale-block residue either. The writer waits only for in-flight
+/// DECISIONS (microseconds), never for in-flight upstream exchanges: a
+/// query already forwarding does not re-decide.
+///
+/// THE TWO LOAD-BEARING DETAILS, pinned by tests:
+/// - `FilterEngine::new()`, NEVER `default()`: `default()` carries no
+///   canary, and the watchdog decides the canary through this same handle —
+///   a canary-less swap makes it tear down the NRPT rule (fail-safe
+///   direction, self-inflicted cause).
+/// - poisoning tolerance on the write lock, matching the readers.
+///
+/// Two engines coexist briefly (old readers finish while new queries see
+/// the new engine); at ~100k rules that is tens of MB for the swap window.
+pub(crate) fn apply_refresh_report(
+    handle: &WebProtectionHandle,
+    report: super::lists::RefreshReport,
+) -> Option<u64> {
+    if !report.changed {
+        return None;
+    }
+    let slot = handle.engine_handle()?;
+    let boot_cfg = handle.boot_config()?;
+    // Build OFF-LOCK: parsing a ~100k-rule list under the write lock would
+    // stall every query for the duration. The swap itself is one move.
+    let mut new_engine = FilterEngine::new();
+    let rules = load_lists(&mut new_engine, boot_cfg);
+    *slot.write().unwrap_or_else(|p| p.into_inner()) = new_engine;
+    Some(rules)
+}
+
 /// Load the configured lists into a fresh engine, returning the rule count.
 ///
+/// Used at startup AND by the live reload swap ([`apply_refresh_report`]).
 /// Failures are warned and skipped rather than aborting startup: a
 /// missing blocklist file means less filtering, and less filtering is the
 /// direction this subsystem is allowed to fail in.
-fn load_lists(engine: &mut FilterEngine, cfg: &WebProtectionConfig) -> u64 {
+pub(crate) fn load_lists(engine: &mut FilterEngine, cfg: &WebProtectionConfig) -> u64 {
     for entry in &cfg.allowlist {
         // Config syntax: bare = exact, leading dot = suffix. `false` here
         // means the operator's rule vanished, which is a config error and
@@ -952,6 +1020,7 @@ mod tests {
             rule_guid: None,
             upstreams_handle: Some(uh.clone()),
             watchdog: Some(wd),
+            boot_config: None,
         };
         assert_eq!(handle.status().upstreams, vec!["192.0.2.1:53"]);
         uh.set(vec!["192.0.2.2:53".parse().unwrap(), "192.0.2.3:53".parse().unwrap()])
@@ -986,6 +1055,7 @@ mod tests {
             rule_guid: None,
             upstreams_handle: None,
             watchdog: None,
+            boot_config: None,
         };
         let s = handle.status();
         assert_eq!(s.upstreams, vec!["192.0.2.9:53"]);
@@ -1024,6 +1094,7 @@ mod tests {
             rule_guid: None,
             upstreams_handle: Some(proxy.upstreams_handle()),
             watchdog: Some(wd),
+            boot_config: None,
         };
         let s = handle.status();
         assert_eq!(s.upstreams_degraded, vec!["192.0.2.2:53"]);
@@ -1059,10 +1130,163 @@ mod tests {
             rule_guid: None,
             upstreams_handle: Some(proxy.upstreams_handle()),
             watchdog: Some(wd),
+            boot_config: None,
         };
         let s = handle.status();
         assert!(s.watchdog_fired);
         assert!(s.detail.contains("watchdog fired"), "{}", s.detail);
         assert_eq!(s.state, ProxyState::Serving);
+    }
+
+    // ------------------------------------------------------------------
+    // Live list reload (update-cycle engine swap)
+    // ------------------------------------------------------------------
+
+    use crate::web_protection::lists::RefreshReport;
+    use dnsguard::filter::{CANARY_DOMAIN, Decision};
+
+    /// A handle whose engine slot is a REAL bound proxy's — the very `Arc`
+    /// the serving loop takes a read lock on per query — with `boot_config`
+    /// attached, in the shape `start` publishes.
+    fn serving_handle(cfg: WebProtectionConfig, slot: Arc<RwLock<FilterEngine>>) -> WebProtectionHandle {
+        WebProtectionHandle {
+            enabled: true,
+            state: ProxyState::Serving,
+            detail: String::new(),
+            listen: None,
+            resolved_upstreams: Vec::new(),
+            upstreams_healthy: 0,
+            upstreams_total: 0,
+            rules_loaded: 0,
+            counters: None,
+            engine: Some(slot),
+            rule_guid: None,
+            upstreams_handle: None,
+            watchdog: None,
+            boot_config: Some(cfg),
+        }
+    }
+
+    fn write_list(contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sentinella-wp-reload-test-{}-{}.hosts",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn decide(slot: &Arc<RwLock<FilterEngine>>, name: &str) -> Decision {
+        slot.read().unwrap_or_else(|p| p.into_inner()).decide(name)
+    }
+
+    /// (i) THE feature: a refreshed list takes effect on the RUNNING proxy
+    /// with no restart. The slot comes from a real bound `Proxy`, so
+    /// swapping through the handle and then deciding THROUGH THE SAME ARC
+    /// is exactly what the next live query does (the serving loop reads
+    /// this Arc per query and decides before the cache lookup). A full DNS
+    /// round-trip harness — `run()` plus crafted wire packets — would add
+    /// the network without adding coverage of the swap itself, so the
+    /// Arc-level boundary is the operative one.
+    #[tokio::test]
+    async fn a_swap_through_the_handle_is_live_on_the_next_decision() {
+        let proxy = bound_proxy(vec!["192.0.2.1:53".parse().unwrap()]).await;
+        let slot = proxy.engine_handle();
+        assert_eq!(decide(&slot, "ads.example"), Decision::Allow, "nothing blocks it yet");
+
+        let list = write_list(b"0.0.0.0 ads.example\n");
+        let cfg = WebProtectionConfig {
+            blocklists: vec![list.to_string_lossy().into_owned()],
+            ..WebProtectionConfig::default()
+        };
+        let handle = serving_handle(cfg, Arc::clone(&slot));
+        let rules = apply_refresh_report(&handle, RefreshReport { changed: true })
+            .expect("a changed report on a serving handle must swap");
+        assert!(rules >= 2, "canary plus one block rule, got {rules}");
+
+        assert_eq!(
+            decide(&slot, "ads.example"),
+            Decision::Block,
+            "the next query through the SAME Arc must see the new rule — no restart"
+        );
+        let _ = std::fs::remove_file(&list);
+    }
+
+    /// (ii) The swapped-in engine is built with `new()`, NEVER `default()`:
+    /// the canary must still decide Block after the swap, or the watchdog —
+    /// which decides the canary through this same handle — tears down the
+    /// NRPT rule and takes the feature down with it. Fails if the swap
+    /// engine is ever built with `default()`.
+    #[tokio::test]
+    async fn the_swapped_engine_keeps_the_canary() {
+        let proxy = bound_proxy(vec!["192.0.2.1:53".parse().unwrap()]).await;
+        let slot = proxy.engine_handle();
+        let handle = serving_handle(WebProtectionConfig::default(), Arc::clone(&slot));
+        apply_refresh_report(&handle, RefreshReport { changed: true }).unwrap();
+        assert_eq!(
+            decide(&slot, CANARY_DOMAIN),
+            Decision::Block,
+            "a canary-less swap makes the watchdog pull the NRPT rule"
+        );
+    }
+
+    /// (iii) changed=false performs NO swap: the gate lives inside
+    /// `apply_refresh_report`, so this pins the production call path, not a
+    /// test-side `if`. Reverting the gate makes the swap happen and flips
+    /// both assertions.
+    #[tokio::test]
+    async fn an_unchanged_report_performs_no_swap() {
+        let proxy = bound_proxy(vec!["192.0.2.1:53".parse().unwrap()]).await;
+        let slot = proxy.engine_handle();
+        // A boot config whose list WOULD block this name if a swap happened.
+        let list = write_list(b"0.0.0.0 must-not-load.example\n");
+        let cfg = WebProtectionConfig {
+            blocklists: vec![list.to_string_lossy().into_owned()],
+            ..WebProtectionConfig::default()
+        };
+        let before = slot.read().unwrap_or_else(|p| p.into_inner()).rule_count();
+        let handle = serving_handle(cfg, Arc::clone(&slot));
+        assert_eq!(apply_refresh_report(&handle, RefreshReport { changed: false }), None);
+        assert_eq!(
+            slot.read().unwrap_or_else(|p| p.into_inner()).rule_count(),
+            before,
+            "an unchanged refresh must not rebuild the engine"
+        );
+        assert_eq!(decide(&slot, "must-not-load.example"), Decision::Allow);
+        let _ = std::fs::remove_file(&list);
+    }
+
+    /// (iv) The reload rebuilds from the BOOT config — including its
+    /// allowlist: a boot-allowlisted name stays allowed after the swap even
+    /// though the refreshed list blocks it. The control name proves the
+    /// blocklist really loaded (without it, a swap that loaded NOTHING would
+    /// also report Allow for the allowlisted name).
+    #[tokio::test]
+    async fn the_swap_preserves_boot_allowlist_precedence() {
+        let proxy = bound_proxy(vec!["192.0.2.1:53".parse().unwrap()]).await;
+        let slot = proxy.engine_handle();
+        let list = write_list(b"0.0.0.0 good.example\n0.0.0.0 bad.example\n");
+        let cfg = WebProtectionConfig {
+            allowlist: vec!["good.example".into()],
+            blocklists: vec![list.to_string_lossy().into_owned()],
+            ..WebProtectionConfig::default()
+        };
+        let handle = serving_handle(cfg, Arc::clone(&slot));
+        apply_refresh_report(&handle, RefreshReport { changed: true }).unwrap();
+        assert_eq!(
+            decide(&slot, "bad.example"),
+            Decision::Block,
+            "control: the refreshed blocklist must actually be in force"
+        );
+        assert_eq!(
+            decide(&slot, "good.example"),
+            Decision::Allow,
+            "the boot allowlist must win over a refreshed blocklist"
+        );
+        let _ = std::fs::remove_file(&list);
     }
 }
