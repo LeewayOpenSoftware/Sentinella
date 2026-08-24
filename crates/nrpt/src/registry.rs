@@ -21,8 +21,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE,
-    REG_DWORD, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
-    RegDeleteKeyExW, RegEnumKeyExW, RegOpenKeyExW, RegSetValueExW,
+    REG_DWORD, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
+    RegCreateKeyExW, RegDeleteKeyExW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW,
 };
 
 use super::Error;
@@ -172,6 +173,111 @@ pub fn list_subkeys(path: &str) -> Result<Vec<String>, Error> {
     Ok(out)
 }
 
+/// Read the two values the orphan-surface pattern matches on: `Name`
+/// (REG_MULTI_SZ) and `GenericDNSServers` (REG_SZ).
+///
+/// `Ok(None)` means the rule vanished between enumeration and read — a
+/// normal race, not a failure. A missing VALUE reads as its empty form (a
+/// rule with no `Name` cannot be a catch-all), and every other failure
+/// propagates: unreadable is not absent, here as everywhere in this crate.
+pub fn read_rule_values(path: &str, guid: &str) -> Result<Option<(Vec<String>, String)>, Error> {
+    let parent = open_read(path)?;
+    let mut child = HKEY::default();
+    let rc = unsafe {
+        RegOpenKeyExW(
+            parent.0,
+            windows::core::PCWSTR(wide(guid).as_ptr()),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut child,
+        )
+    };
+    match rc {
+        ERROR_SUCCESS => {}
+        ERROR_FILE_NOT_FOUND => return Ok(None),
+        other => return Err(map_err(other, &format!("{path}\\{guid}"))),
+    }
+    let child = Key(child);
+    let names = query_value(child.0, "Name", REG_MULTI_SZ)?
+        .map(|b| decode_multi_sz(&b))
+        .unwrap_or_default();
+    let servers = query_value(child.0, "GenericDNSServers", REG_SZ)?
+        .map(|b| decode_sz(&b))
+        .unwrap_or_default();
+    Ok(Some((names, servers)))
+}
+
+/// Raw bytes of one registry value, or None when the value is not there.
+/// A type mismatch is an error, not an empty read: it means the key is not
+/// shaped like an NRPT rule at all, and guessing at a decode would be worse.
+fn query_value(key: HKEY, name: &str, expect: REG_VALUE_TYPE) -> Result<Option<Vec<u8>>, Error> {
+    let name_w = wide(name);
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            windows::core::PCWSTR(name_w.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    match rc {
+        ERROR_SUCCESS => {}
+        ERROR_FILE_NOT_FOUND => return Ok(None),
+        other => return Err(map_err(other, name)),
+    }
+    let mut ty = REG_VALUE_TYPE::default();
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            windows::core::PCWSTR(name_w.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(buf.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_err(rc, name));
+    }
+    if ty != expect {
+        return Err(Error::Registry(format!(
+            "{name}: expected value type {}, found {}",
+            expect.0, ty.0
+        )));
+    }
+    buf.truncate(size as usize);
+    Ok(Some(buf))
+}
+
+/// REG_SZ bytes are UTF-16LE, NUL-terminated, and the reported size
+/// includes the terminator.
+fn decode_sz(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
+/// REG_MULTI_SZ is NUL-separated UTF-16LE with a double-NUL terminator.
+/// Empty entries are dropped — they are terminators, not names.
+fn decode_multi_sz(bytes: &[u8]) -> Vec<String> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    units
+        .split(|&u| u == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
 /// Create (or open) the rule subkey and write its values in one shot.
 ///
 /// ORDER MATTERS INSIDE HERE TOO. The values are written BEFORE the key is
@@ -308,4 +414,37 @@ fn set_dword(key: HKEY, name: &str, value: u32) -> Result<(), Error> {
         return Err(map_err(rc, name));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide_bytes(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn sz_decode_strips_the_terminator() {
+        let mut b = wide_bytes("127.0.0.1");
+        b.extend([0, 0]);
+        assert_eq!(decode_sz(&b), "127.0.0.1");
+        // A missing terminator (a hand-written value) still decodes.
+        assert_eq!(decode_sz(&wide_bytes("127.0.0.1")), "127.0.0.1");
+        assert_eq!(decode_sz(&[]), "");
+    }
+
+    #[test]
+    fn multi_sz_decode_splits_and_drops_terminators() {
+        let mut b = wide_bytes(".");
+        b.extend([0, 0]);
+        b.extend(wide_bytes("example.com"));
+        b.extend([0, 0, 0, 0]);
+        assert_eq!(
+            decode_multi_sz(&b),
+            vec![".".to_string(), "example.com".to_string()]
+        );
+        // The empty list is one lone terminator: no names, not one empty name.
+        assert_eq!(decode_multi_sz(&[0, 0]), Vec::<String>::new());
+    }
 }

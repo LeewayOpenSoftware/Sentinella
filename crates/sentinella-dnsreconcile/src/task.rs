@@ -128,11 +128,28 @@ pub fn install() -> Result<(), String> {
 pub fn remove() -> Result<(), String> {
     match schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]) {
         Ok(()) => Ok(()),
-        // schtasks does not give a stable "not found" exit code, so match
-        // on the message. Being wrong here only costs a spurious warning
-        // during uninstall.
-        Err(e) if e.contains("cannot find") || e.contains("does not exist") => Ok(()),
-        Err(e) => Err(e),
+        Err(e) => delete_outcome(e, schtasks(&["/Query", "/TN", TASK_NAME])),
+    }
+}
+
+/// What a failed delete means, decided WITHOUT reading its message text.
+///
+/// schtasks has no stable "not found" exit code, and its messages are
+/// localized — matching "cannot find"/"does not exist" works only on
+/// English Windows, which is exactly the class of bug this crate uses raw
+/// SIDs to avoid (see `task_xml`). So absence is VERIFIED instead: a task
+/// that no longer answers /Query is gone, whatever the delete said and in
+/// whatever language. The residual wrong direction is a query that fails
+/// for a reason other than absence (permissions) while the task exists;
+/// every caller is elevated, and being wrong that way costs only a
+/// spurious success during uninstall.
+fn delete_outcome(delete_err: String, query: Result<(), String>) -> Result<(), String> {
+    match query {
+        // The task does not answer to its name: gone, which was the goal.
+        Err(_) => Ok(()),
+        // Still there: the delete genuinely failed, and the caller must
+        // hear about it.
+        Ok(()) => Err(delete_err),
     }
 }
 
@@ -213,5 +230,24 @@ mod tests {
     fn the_task_lives_in_our_own_folder() {
         assert_eq!(TASK_NAME, r"\Sentinella\DnsReconcile");
         assert!(task_xml(Path::new("x")).contains(r"<URI>\Sentinella\DnsReconcile</URI>"));
+    }
+
+    /// The localized-Windows case (audit F5): a delete that failed with a
+    /// message in ANY language must still read as success when the task is
+    /// actually gone — and must NOT read as success when it is not. The
+    /// old message-text match ("cannot find"/"does not exist") passes the
+    /// first case only on English Windows and is why the decision moved to
+    /// a re-query.
+    #[test]
+    fn a_failed_delete_is_decided_by_requery_not_by_message_text() {
+        // Delete failed, task is gone: success regardless of language.
+        let localized = "schtasks exited 1: ERROR: no existe la tarea especificada".to_string();
+        assert!(delete_outcome(localized, Err("query failed".into())).is_ok());
+        // Delete failed, task is STILL there: the error must survive.
+        let denied = "schtasks exited 1: ERROR: access is denied".to_string();
+        match delete_outcome(denied.clone(), Ok(())) {
+            Err(e) => assert_eq!(e, denied),
+            Ok(()) => panic!("a live task must not read as removed"),
+        }
     }
 }

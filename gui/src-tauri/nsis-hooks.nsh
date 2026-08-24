@@ -35,9 +35,27 @@
   ;    predates the reconciler) is fine: there is no rule to remove.
   IfFileExists "$INSTDIR\daemon\sentinella-dnsreconcile.exe" 0 +3
     nsExec::ExecToLog '"$INSTDIR\daemon\sentinella-dnsreconcile.exe" --remove'
-    Goto senti_rule_done
-  IfFileExists "$INSTDIR\resources\daemon\sentinella-dnsreconcile.exe" 0 +2
+    Goto senti_rule_check
+  IfFileExists "$INSTDIR\resources\daemon\sentinella-dnsreconcile.exe" 0 senti_rule_done
     nsExec::ExecToLog '"$INSTDIR\resources\daemon\sentinella-dnsreconcile.exe" --remove'
+  senti_rule_check:
+  Pop $0
+  StrCmp $0 "0" senti_rule_done 0
+    ; The removal FAILED and this is an UPGRADE, so warn, don't abort —
+    ; the asymmetry with PREUNINSTALL (which aborts on the same failure)
+    ; is deliberate. An aborted uninstall leaves the old product fully in
+    ; place, reconciler task included, so the next boot repairs itself.
+    ; An aborted upgrade leaves the OLD daemon already stopped and deleted
+    ; below, the rule live, and nothing new installed — the worst version
+    ; of the state. Continuing installs the new daemon, whose startup
+    ; reconcile_orphan_rule removes a stale rule in-session, and the boot
+    ; reconciler backstops that on the next reboot.
+    ;
+    ; Note exit 3 means "an orphan-pattern rule is present, surfaced, not
+    ; deleted" — the message below covers it, because that state also ends
+    ; with a human reading the log.
+    IfSilent senti_rule_done 0
+      MessageBox MB_ICONEXCLAMATION|MB_OK "Sentinella's old DNS policy rule could not be fully removed before the upgrade (code $0).$\n$\nThe upgrade will continue; the new installation removes a leftover rule automatically at startup. If name resolution is broken afterwards, reboot - the boot-time reconciler removes the rule.$\n$\nDetails: %ProgramData%\Sentinella\logs\dnsreconcile.log"
   senti_rule_done:
 
   ; 3. Only now force. Otherwise Windows keeps sentinelld.exe locked and NSIS
@@ -92,6 +110,70 @@
   IfFileExists "$SENTI_DATA\config\sentinelld.toml" +2 0
     CopyFiles /SILENT "$SENTI_DAEMON\runtime\config\sentinelld.toml" "$SENTI_DATA\config\"
 
+  ; === [web_protection] default section (append only if absent) ===
+  ; The shipped template has no [web_protection] section, so without this
+  ; a user who enables web protection filters with the compiled-in canary
+  ; only: neither the vendored seed nor the managed copy is referenced by
+  ; any default config (audit unit-3 F4). enabled=false is deliberate and
+  ; load-bearing: the NRPT rule must never appear before explicit opt-in
+  ; (degrade to no filtering, never no DNS). listen/upstreams/
+  ; health_check_name match the daemon defaults (web_protection/config.rs)
+  ; so the written section validates clean.
+  ;
+  ; Probe-then-append, never clobber. The whole-file guard above already
+  ; never overwrites sentinelld.toml, and this extends the same semantics
+  ; to a file the template grew into: a user-edited section (custom
+  ; upstreams, corporate allowlist, enabled=true) survives every upgrade
+  ; untouched.
+  ;
+  ; The daemon-side alternative — load_lists falling back to the managed
+  ; path when blocklists is empty — was considered and NOT taken: wiring
+  ; the path explicitly here keeps "which list filters me" visible in the
+  ; config the user edits, and lists.rs deliberately deferred that
+  ; fallback. One mechanism, not two.
+  Var /GLOBAL SENTI_WP_SECTION
+  StrCpy $SENTI_WP_SECTION "0"
+  FileOpen $0 "$SENTI_DATA\config\sentinelld.toml" r
+  IfErrors senti_wp_probe_done
+  senti_wp_read:
+    FileRead $0 $1
+    IfErrors senti_wp_probe_close
+  senti_wp_ltrim:
+    StrCpy $2 $1 1
+    StrCmp $2 " " senti_wp_drop
+    StrCmp $2 "$\t" senti_wp_drop
+    Goto senti_wp_compare
+  senti_wp_drop:
+    StrCpy $1 $1 "" 1
+    StrCmp $1 "" senti_wp_read senti_wp_ltrim
+  senti_wp_compare:
+    StrCpy $2 $1 16
+    StrCmp $2 "[web_protection]" 0 senti_wp_read
+    StrCpy $SENTI_WP_SECTION "1"
+  senti_wp_probe_close:
+    FileClose $0
+  senti_wp_probe_done:
+
+  StrCmp $SENTI_WP_SECTION "1" senti_wp_done 0
+  FileOpen $0 "$SENTI_DATA\config\sentinelld.toml" a
+  IfErrors senti_wp_done
+    ; The leading blank line guards a file with no trailing newline; TOML
+    ; tolerates blank lines. The template is LF, so the appended lines are
+    ; LF too — mixed endings in one config are a needless surprise.
+    FileWrite $0 "$\n"
+    FileWrite $0 "[web_protection]$\n"
+    FileWrite $0 "enabled = false$\n"
+    FileWrite $0 'listen = "127.0.0.1:53"$\n'
+    FileWrite $0 'upstreams = ["system"]$\n'
+    FileWrite $0 'block_response = "nxdomain"$\n'
+    FileWrite $0 'health_check_name = "example.com"$\n'
+    ; Single-quoted TOML literal string: backslashes need no escaping.
+    FileWrite $0 "blocklists = ['$SENTI_DATA\rules\dns\managed\stevenblack.hosts']$\n"
+    FileWrite $0 "allowlist = []$\n"
+    FileWrite $0 "log_queries = false$\n"
+    FileClose $0
+  senti_wp_done:
+
   ; === Copy YARA rules ===
   CopyFiles /SILENT "$SENTI_DAEMON\runtime\argus\rules\yara\*.yar" "$SENTI_DATA\argus\rules\yara\"
 
@@ -112,6 +194,19 @@
   IfFileExists "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" 0 senti_dns_done
     CopyFiles /SILENT "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" "$SENTI_DATA\rules\dns\"
   senti_dns_done:
+
+  ; === Seed the MANAGED copy of the DNS blocklist (only if absent) ===
+  ; The [web_protection] section above points blocklists at the managed
+  ; path, which the daemon's fetcher refreshes on each update cycle. Until
+  ; the first successful fetch that file does not exist, so first-enable
+  ; on an offline machine would filter canary-only; seeding it from the
+  ; vendored copy closes that window. Same per-file guard as every other
+  ; seed in this hook, for the same reason: an upgrade must never
+  ; overwrite a copy the fetcher (or the user) has already refreshed.
+  IfFileExists "$SENTI_DATA\rules\dns\managed\stevenblack.hosts" senti_dns_managed_done 0
+  IfFileExists "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" 0 senti_dns_managed_done
+    CopyFiles /SILENT "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" "$SENTI_DATA\rules\dns\managed\"
+  senti_dns_managed_done:
 
   ; === Copy bootstrap ClamAV signatures (per database, only if absent) ===
   ; This avoids overwriting newer signatures from a previous install/freshclam.

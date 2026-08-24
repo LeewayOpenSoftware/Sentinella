@@ -1,5 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
+  ═══════════════════════════════════════════════════════════════════
+  UNBUILT AND UNSHIPPED — DO NOT TRUST AS MAINTAINED (2026-08-24)
+
+  Nothing builds this file. No script in scripts/ invokes candle/light/
+  wix, and tauri.conf.json targets ["nsis"] only — the shipped installer
+  is NSIS (gui/src-tauri/nsis-hooks.nsh), which is where every install/
+  uninstall fix lands. This WiX source is dormant and free to rot while
+  looking maintained. Known stale spot if it is ever revived:
+  registration of the DnsReconcile task is conditioned on
+  `NOT Installed`, so a REPAIR would not re-register a deleted task.
+
+  Read it as a design sketch only. Deleting it vs. shipping it is the
+  owner's call (audit unit-3 spec d) — until then, verify any behaviour
+  question against the NSIS hooks, never against this file.
+  ═══════════════════════════════════════════════════════════════════
+
   Sentinella Antivirus — Windows Installer (WiX 4)
 
   Build requires:

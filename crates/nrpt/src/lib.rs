@@ -37,7 +37,11 @@
 //! rule must write its GUID to disk BEFORE creating it. A missing GUID file
 //! then means the rule was never created — not that we have lost track of
 //! one. The installing side (commit C) has to honour that ordering; this
-//! crate's `record_guid` exists to make it the easy thing to do.
+//! crate's `record_guid` exists to make it the easy thing to do, and to
+//! make the record durable (fsync of the file AND its directory).
+//! [`unrecorded_catchall_rules`] is the tripwire for the day the invariant
+//! breaks anyway: it surfaces — never deletes — rules that match our shape
+//! without a record.
 
 use std::path::Path;
 
@@ -68,11 +72,48 @@ mod registry {
     ) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    pub fn read_rule_values(
+        _path: &str,
+        _guid: &str,
+    ) -> Result<Option<(Vec<String>, String)>, Error> {
+        Err(Error::Unsupported)
+    }
 }
 
 /// Where local (non-GPO) NRPT rules live.
 pub const DNS_POLICY_CONFIG: &str =
     r"SYSTEM\CurrentControlSet\Services\DnsCache\Parameters\DnsPolicyConfig";
+
+/// Where GPO-deployed NRPT rules live. A separate container from the local
+/// store, and group policy WINS over local rules: a rule here makes our
+/// local rule inert. That fails safe (filtering-absent, never no-DNS), but
+/// it is exactly the lie the design doc says to surface rather than tell:
+/// "GPO presence → surface 'web protection ineffective (GPO NRPT present)',
+/// don't silently degrade" (WEB_PROTECTION_DESIGN.md).
+pub const GPO_DNS_POLICY_CONFIG: &str =
+    r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig";
+
+/// Is ANY rule present under the GPO NRPT container?
+///
+/// Read-only, and honest about failure the same way the rest of the crate
+/// is: an unreadable container is `Err`, never "absent". A caller that
+/// would surface "GPO present" to the user must not get to report
+/// "definitely no GPO" on the strength of an access error.
+pub fn gpo_nrpt_present() -> Result<bool, Error> {
+    any_rule(registry::list_subkeys(GPO_DNS_POLICY_CONFIG))
+}
+
+/// The decision half of [`gpo_nrpt_present`], split out so it is testable
+/// without a live registry.
+fn any_rule(listing: Result<Vec<String>, Error>) -> Result<bool, Error> {
+    match listing {
+        // The container itself is absent on a machine that has never had a
+        // GPO NRPT rule: genuinely no GPO rules, not an error.
+        Err(Error::NoPolicyContainer) => Ok(false),
+        Ok(rules) => Ok(!rules.is_empty()),
+        Err(e) => Err(e),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -378,6 +419,62 @@ pub fn list_rules() -> Result<Vec<String>, Error> {
     }
 }
 
+/// The loopback address our rules point at, as the DNS Client writes it
+/// into `GenericDNSServers`.
+const PROXY_SERVER: &str = "127.0.0.1";
+
+/// The shape of a rule that routes the whole machine's DNS at our proxy:
+/// catch-all namespace AND our loopback among the servers. Both halves are
+/// required — either one alone matches other people's legitimate policy
+/// (a loopback rule for one zone is split DNS; a catch-all pointing
+/// elsewhere is somebody else's filter).
+fn matches_orphan_pattern(names: &[String], servers: &str) -> bool {
+    names.iter().any(|n| n.trim() == NAMESPACE_ALL)
+        && servers.split(';').any(|s| s.trim() == PROXY_SERVER)
+}
+
+/// Is `guid` the one this installation recorded? Case-insensitive: the
+/// registry preserves the case we wrote, but a hand-restored state file
+/// may not.
+fn is_recorded(recorded: Option<&str>, guid: &str) -> bool {
+    recorded.is_some_and(|r| r.eq_ignore_ascii_case(guid))
+}
+
+/// Local-store rules that LOOK like ours — catch-all namespace, loopback
+/// server — but that no recorded GUID names. SURFACE ONLY: this exists so
+/// a caller can log and alarm, never so it can delete.
+///
+/// Why auto-delete is the trap: "matches our shape, no record" means one
+/// of two things this process cannot tell apart. It can be our own
+/// orphan — the record lost to power loss, a ProgramData cleanup, a
+/// partial restore — and then deletion would be correct and urgent. Or it
+/// can be somebody else's rule that happens to route at 127.0.0.1: another
+/// product's DNS filter, an administrator's policy, a deliberate
+/// honeypot — and then deletion is precisely the foreign-rule-deletion
+/// failure the identity design refuses at every other layer. A GUID we
+/// have no record of is a GUID we cannot claim, whatever it looks like.
+/// So the contract is: surface loudly, let a human with
+/// `Get-DnsClientNrptRule` decide.
+pub fn unrecorded_catchall_rules(state_file: &Path) -> Result<Vec<String>, Error> {
+    let recorded = recorded_guid(state_file);
+    let mut out = Vec::new();
+    for guid in list_rules()? {
+        if is_recorded(recorded.as_deref(), &guid) {
+            continue;
+        }
+        match registry::read_rule_values(DNS_POLICY_CONFIG, &guid)? {
+            // Vanished between enumeration and read: a normal race.
+            None => continue,
+            Some((names, servers)) => {
+                if matches_orphan_pattern(&names, &servers) {
+                    out.push(guid);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Where the rule GUID is recorded, by convention shared with the daemon.
 ///
 /// Deliberately NOT derived from the daemon's `paths` module: the
@@ -411,6 +508,14 @@ pub fn recorded_guid(state_file: &Path) -> Option<String> {
 /// alone: if this file is missing, the rule does not exist. Written to a
 /// temporary file and renamed so a crash mid-write cannot leave a half
 /// GUID that `recorded_guid` would reject and a rule that outlives it.
+///
+/// "Durably" is load-bearing and means two fsyncs, not zero: the temp file
+/// is synced BEFORE the rename (the pattern the daemon's config and
+/// signature-update writes already use), and the containing directory is
+/// synced AFTER it — without the second, a power loss in the window can
+/// drop the rename itself, and the machine is left with a live rule every
+/// layer agrees was never created. A sync failure fails the whole call, so
+/// the caller refuses to install the rule: that costs filtering, never DNS.
 pub fn record_guid(state_file: &Path, guid: &str) -> Result<(), Error> {
     validate_guid(guid)?;
     if let Some(parent) = state_file.parent() {
@@ -418,9 +523,56 @@ pub fn record_guid(state_file: &Path, guid: &str) -> Result<(), Error> {
             .map_err(|e| Error::Registry(format!("state dir: {e}")))?;
     }
     let tmp = state_file.with_extension("tmp");
-    std::fs::write(&tmp, guid).map_err(|e| Error::Registry(format!("state write: {e}")))?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| Error::Registry(format!("state write: {e}")))?;
+        f.write_all(guid.as_bytes())
+            .map_err(|e| Error::Registry(format!("state write: {e}")))?;
+        // Without this the rename below can complete and the system can
+        // crash with the GUID never having reached the disk.
+        f.sync_all()
+            .map_err(|e| Error::Registry(format!("state sync: {e}")))?;
+    }
     std::fs::rename(&tmp, state_file).map_err(|e| Error::Registry(format!("state rename: {e}")))?;
+    if let Some(parent) = state_file.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
+}
+
+/// fsync a directory so the rename that just happened inside it survives
+/// power loss.
+///
+/// Windows cannot open a directory with `File::open`; it needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which std's `custom_flags` reaches with
+/// no extra dependency, and `FlushFileBuffers` (what `sync_all` calls)
+/// requires GENERIC_WRITE on a directory handle — a read handle is
+/// ERROR_ACCESS_DENIED. No other durable write in the codebase syncs its
+/// directory; this one does because a lost rename here strands a rule
+/// forever — the single worst failure mode in the design.
+#[cfg(windows)]
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let d = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map_err(|e| Error::Registry(format!("state dir sync: {e}")))?;
+    d.sync_all()
+        .map_err(|e| Error::Registry(format!("state dir sync: {e}")))
+}
+
+#[cfg(not(windows))]
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| Error::Registry(format!("state dir sync: {e}")))
 }
 
 /// Forget the recorded GUID. Call only AFTER the rule is gone: the reverse
@@ -525,6 +677,72 @@ mod tests {
         clear_guid(&f).unwrap();
         clear_guid(&f).expect("clearing an absent record must succeed");
         assert_eq!(recorded_guid(&f), None);
+    }
+
+    /// The temp file is a means, not a residue: after a successful record
+    /// only the state file itself may remain.
+    #[test]
+    fn recording_leaves_no_temp_file_behind() {
+        let f = scratch("notmp.txt");
+        record_guid(&f, GOOD).unwrap();
+        assert!(!f.with_extension("tmp").exists());
+        assert_eq!(recorded_guid(&f).as_deref(), Some(GOOD));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// The surface logic, against the rule shapes it must classify. Each
+    /// assertion is a distinct fixture; weakening the pattern (namespace OR
+    /// server alone sufficing) or the recorded-GUID exclusion fails this.
+    #[test]
+    fn orphan_pattern_classification_fixtures() {
+        // ours-with-record: pattern matches but the GUID is recorded, so it
+        // is excluded — case-insensitively, because a hand-restored state
+        // file may not preserve case.
+        assert!(is_recorded(Some(GOOD), GOOD));
+        assert!(is_recorded(Some(GOOD), &GOOD.to_lowercase()));
+
+        // ours-no-record and foreign-GUID are the SAME fixture from inside
+        // this crate: the pattern matches and nothing records the GUID.
+        // Both are surfaced — and the doc on unrecorded_catchall_rules
+        // explains why surfacing is ALL we may do.
+        assert!(!is_recorded(None, GOOD));
+        assert!(!is_recorded(
+            Some(GOOD),
+            "{11111111-2222-3333-4444-555555555555}"
+        ));
+        assert!(matches_orphan_pattern(&[".".to_string()], "127.0.0.1"));
+
+        // wrong-namespace: a loopback rule for one zone is somebody's
+        // split DNS, not a machine-wide orphan.
+        assert!(!matches_orphan_pattern(
+            &[".corp.example.com".to_string()],
+            "127.0.0.1"
+        ));
+        // wrong-nameserver: a catch-all pointing elsewhere is not ours.
+        assert!(!matches_orphan_pattern(&[".".to_string()], "10.0.0.53"));
+
+        // The multi-entry shapes Windows actually writes.
+        assert!(matches_orphan_pattern(
+            &[".".to_string()],
+            "127.0.0.1;127.0.0.2"
+        ));
+        assert!(matches_orphan_pattern(
+            &[".".to_string(), "example.com".to_string()],
+            " 127.0.0.1 "
+        ));
+    }
+
+    /// The GPO decision must never collapse "could not read" into "no GPO
+    /// rules": a caller surfaces one of those to the user as fact.
+    #[test]
+    fn gpo_decision_never_collapses_unreadable_into_absent() {
+        assert_eq!(any_rule(Err(Error::NoPolicyContainer)), Ok(false));
+        assert_eq!(any_rule(Ok(vec![])), Ok(false));
+        assert_eq!(any_rule(Ok(vec![GOOD.to_string()])), Ok(true));
+        match any_rule(Err(Error::AccessDenied("denied".into()))) {
+            Err(Error::AccessDenied(_)) => {}
+            other => panic!("access-denied must propagate, got {other:?}"),
+        }
     }
 
     /// A rule with no servers routes its whole namespace into a black
@@ -805,6 +1023,38 @@ mod tests {
             // a machine that simply has no rules.
             let _ = rule_exists(GOOD);
             let _ = list_rules();
+        }
+    }
+
+    /// Read-only look at the live GPO NRPT container. IGNORED because the
+    /// answer depends on the box's group policy; the pure decision logic
+    /// is covered by `gpo_decision_never_collapses_unreadable_into_absent`.
+    ///
+    ///   cargo test -p nrpt real_gpo -- --ignored --nocapture
+    ///
+    /// Prerequisites: none beyond Windows — the read needs no elevation.
+    #[test]
+    #[ignore = "environment-dependent: reads the live GPO NRPT container"]
+    fn real_gpo_container_read_only() {
+        match gpo_nrpt_present() {
+            Ok(true) => println!("GPO NRPT rules ARE present - local rules are inert"),
+            Ok(false) => println!("no GPO NRPT rules (expected on most machines)"),
+            Err(e) => println!("could not read the GPO container: {e}"),
+        }
+    }
+
+    /// Read-only run of the orphan-pattern scan against the live store.
+    /// IGNORED: environment-dependent. Deletes nothing, ever — that is the
+    /// whole point of the function.
+    ///
+    ///   cargo test -p nrpt real_orphan_scan -- --ignored --nocapture
+    #[test]
+    #[ignore = "environment-dependent: enumerates the live NRPT store"]
+    fn real_orphan_scan_read_only() {
+        match unrecorded_catchall_rules(&default_state_file()) {
+            Ok(found) if found.is_empty() => println!("no orphan-pattern rules"),
+            Ok(found) => println!("orphan-pattern rules (surfaced only): {found:?}"),
+            Err(e) => println!("scan failed: {e}"),
         }
     }
 }

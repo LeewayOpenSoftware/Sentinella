@@ -28,6 +28,13 @@
 //! It also never INSTALLS a rule. Installing is a decision that requires
 //! proof the proxy works, and this process is deliberately too dumb to
 //! obtain that proof.
+//!
+//! And it never deletes a rule it has no record of. A catch-all rule
+//! pointing at 127.0.0.1 with no matching GUID record is either our own
+//! orphan or somebody else's rule that looks like ours, and the two are
+//! indistinguishable from here — so it is SURFACED (log line, console,
+//! exit code 3), never removed. Deleting on a shape match is the
+//! foreign-rule-deletion trap the nrpt crate's identity design refuses.
 
 mod task;
 
@@ -105,7 +112,10 @@ sentinella-dnsreconcile - removes Sentinella's NRPT rule unless the proxy is ali
   --version   print the version
 
 Exit 0 = the system is in the intended state. Exit 1 = it is not and we
-could not fix it (almost always: not running as SYSTEM/Administrator).";
+could not fix it (almost always: not running as SYSTEM/Administrator).
+Exit 3 = an orphan-pattern rule is present: a catch-all rule routing DNS
+at 127.0.0.1 that no GUID record names. Surfaced in the log and on the
+console, deliberately NOT deleted - it may not be ours.";
 
 /// Installer entry point. Separate from reconciliation on purpose: this
 /// binary must be able to register its own task WITHOUT touching NRPT
@@ -191,14 +201,91 @@ enum Mode {
     ForceRemove,
 }
 
+/// Distinct from 1 ("we failed") because nothing failed: there is
+/// something on this machine that needs a human decision, and the log
+/// says what. Surfaced by the orphan-pattern scan only.
+const EXIT_ORPHAN_SURFACED: i32 = 3;
+
 fn run(mode: Mode) -> i32 {
     let state_file = nrpt::default_state_file();
+    // The orphan-pattern scan runs on EVERY invocation, before the
+    // recorded-rule logic: the state it catches is precisely the one where
+    // the recorded-rule logic has nothing to say ("no recorded rule -
+    // nothing to reconcile").
+    let scan = scan_for_orphan_pattern_rules(&state_file);
+    combine_exit(scan, reconcile(mode, &state_file))
+}
 
+/// What the orphan-pattern scan found, for the exit-code decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OrphanScan {
+    /// No unrecorded catch-all-to-loopback rule is present.
+    Clean,
+    /// At least one is present; logged and printed, deliberately not
+    /// deleted.
+    Found,
+    /// The scan itself could not be completed. NOT the same as Clean:
+    /// "could not check" must not exit like "checked, nothing there" —
+    /// the same rule the reconcile path applies to an unreadable registry.
+    Unknown,
+}
+
+/// The scan can change a clean result but never masks a failure: a
+/// reconcile that already failed keeps its 1.
+fn combine_exit(scan: OrphanScan, code: i32) -> i32 {
+    if code != 0 {
+        return code;
+    }
+    match scan {
+        OrphanScan::Clean => 0,
+        OrphanScan::Found => EXIT_ORPHAN_SURFACED,
+        OrphanScan::Unknown => 1,
+    }
+}
+
+/// SURFACE ONLY. A catch-all rule routing at 127.0.0.1 with no recorded
+/// GUID is either our own orphan (the record was lost, which the identity
+/// design assumes cannot happen) or somebody else's rule that happens to
+/// look like ours. From inside this process the two are indistinguishable
+/// — which is exactly why this never deletes: deleting the second kind is
+/// the foreign-rule-deletion trap the nrpt crate docs refuse. What we can
+/// safely do is make it VISIBLE: log, console, exit code.
+fn scan_for_orphan_pattern_rules(state_file: &Path) -> OrphanScan {
+    match nrpt::unrecorded_catchall_rules(state_file) {
+        Ok(found) => {
+            for guid in &found {
+                let msg = format!(
+                    "orphan-pattern rule {guid} present, no record - surfacing, not deleting: \
+                     a catch-all rule routes this machine's DNS at 127.0.0.1, but no GUID \
+                     record names it as ours"
+                );
+                log(state_file, &msg);
+                eprintln!("sentinella-dnsreconcile: {msg}");
+            }
+            if found.is_empty() {
+                OrphanScan::Clean
+            } else {
+                OrphanScan::Found
+            }
+        }
+        // A non-Windows host has no NRPT at all; reconcile itself is a
+        // no-op there for the same reason.
+        Err(nrpt::Error::Unsupported) => OrphanScan::Clean,
+        Err(e) => {
+            let msg = format!("could not run the orphan-pattern check: {e}");
+            log(state_file, &msg);
+            eprintln!("sentinella-dnsreconcile: {msg}");
+            OrphanScan::Unknown
+        }
+    }
+}
+
+fn reconcile(mode: Mode, state_file: &Path) -> i32 {
     // No recorded GUID means no rule was ever created: record_guid writes
     // the file BEFORE the rule exists, so this direction is safe. Nothing
     // to reconcile.
-    let Some(guid) = nrpt::recorded_guid(&state_file) else {
-        log(&state_file, "no recorded rule - nothing to reconcile");
+    let Some(guid) = nrpt::recorded_guid(state_file) else {
+        log(state_file, "no recorded rule - nothing to reconcile");
         return 0;
     };
 
@@ -207,9 +294,9 @@ fn run(mode: Mode) -> i32 {
             // The rule is gone but our record lingers — after a manual
             // removal, a registry restore, or a GPO takeover. Tidy up so a
             // later install starts from a clean slate.
-            log(&state_file, &format!("recorded rule {guid} is absent - clearing stale record"));
+            log(state_file, &format!("recorded rule {guid} is absent - clearing stale record"));
             if mode != Mode::DryRun {
-                let _ = nrpt::clear_guid(&state_file);
+                let _ = nrpt::clear_guid(state_file);
             }
             return 0;
         }
@@ -218,25 +305,25 @@ fn run(mode: Mode) -> i32 {
             // CANNOT READ is not CAN CONFIRM ABSENT. Refusing to act on an
             // unreadable registry is the whole reason those are separate
             // error variants: acting would mean deleting on a guess.
-            log(&state_file, &format!("cannot determine rule state: {e}"));
+            log(state_file, &format!("cannot determine rule state: {e}"));
             eprintln!("sentinella-dnsreconcile: {e}");
             return 1;
         }
     }
 
     if mode == Mode::ForceRemove {
-        return remove(&state_file, &guid, mode, "unconditional removal requested");
+        return remove(state_file, &guid, mode, "unconditional removal requested");
     }
 
     // The rule is live. The only thing that justifies leaving it there is
     // proof that OUR proxy is answering at the address it points to.
     if probe_is_ours() {
-        log(&state_file, &format!("rule {guid} is live and the proxy answers - leaving it"));
+        log(state_file, &format!("rule {guid} is live and the proxy answers - leaving it"));
         return 0;
     }
 
     remove(
-        &state_file,
+        state_file,
         &guid,
         mode,
         "rule is live but 127.0.0.1:53 did not answer with our signature",
@@ -524,5 +611,23 @@ mod tests {
             budget < Duration::from_secs(2),
             "probe budget {budget:?} is too long for a startup task"
         );
+    }
+
+    /// The exit-code contract the installer and Task Scheduler see. The
+    /// orphan scan may turn a clean run into 3, and an incomplete scan
+    /// into 1 ("could not check" is not "checked, nothing there") — but
+    /// neither may ever mask a failure the reconcile already reported.
+    /// Revert-check: dropping the scan from `run` fails the Found rows;
+    /// collapsing Unknown into Clean fails the Unknown row.
+    #[test]
+    fn the_orphan_scan_changes_clean_results_and_never_masks_failures() {
+        assert_eq!(combine_exit(OrphanScan::Clean, 0), 0);
+        assert_eq!(combine_exit(OrphanScan::Found, 0), EXIT_ORPHAN_SURFACED);
+        assert_eq!(combine_exit(OrphanScan::Unknown, 0), 1);
+        for scan in [OrphanScan::Clean, OrphanScan::Found, OrphanScan::Unknown] {
+            assert_eq!(combine_exit(scan, 1), 1, "{scan:?} must not mask a failure");
+        }
+        // And the documented contract is in the text the user reads.
+        assert!(USAGE.contains("Exit 3"));
     }
 }
