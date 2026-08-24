@@ -708,7 +708,15 @@ function WebProtectionTile({ onNavigate }: { onNavigate: (p: Page) => void }) {
   let sub: string;
   let color: "accent" | "green" | "amber" | "red" | "neutral";
 
-  if (wp.state === "serving" && wp.nrpt_installed === true) {
+  if (wp.state === "serving" && wp.nrpt_installed === true && wp.gpo_nrpt_present === true) {
+    // Rule installed but INERT: GPO NRPT policy is evaluated instead of
+    // local rules, so no query reaches the proxy. Amber, not green —
+    // reporting "active" here is the exact lie this field exists to catch.
+    // `=== true` only: unknown (null/undefined) must not claim this.
+    color = "amber";
+    value = t("wp.tile_gpo");
+    sub = t("wp.tile_gpo_sub");
+  } else if (wp.state === "serving" && wp.nrpt_installed === true) {
     // Proxy serving AND the system DNS rule is live — actually filtering.
     color = "green";
     value = t("tile.active");

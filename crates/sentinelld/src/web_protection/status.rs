@@ -37,6 +37,15 @@ pub struct WebProtectionStatus {
     /// which is NOT the same as `Some(false)` and must never be rendered
     /// as "not installed".
     pub nrpt_installed: Option<bool>,
+    /// Whether GPO NRPT rules (HKLM\...\DNSClient\DnsPolicyConfig) are
+    /// present on the machine RIGHT NOW. Same tri-state contract as
+    /// `nrpt_installed`, and the same reason for it: `Some(true)` = GPO
+    /// rules present, which makes the OS IGNORE local NRPT rules — our
+    /// rule can be installed and the proxy serving while no query ever
+    /// reaches it; `Some(false)` = no GPO rules; `None` = the read failed,
+    /// which must NEVER be collapsed to `Some(false)`. Read live per status
+    /// call, like `nrpt_installed`.
+    pub gpo_nrpt_present: Option<bool>,
     /// What the listener is doing.
     pub state: ProxyState,
     /// Address actually bound, when serving.
@@ -83,11 +92,14 @@ impl WebProtectionStatus {
     /// would be the kind of confident-but-false statement this project
     /// keeps getting bitten by. (A rule orphaned by a previous run is not
     /// this function's business — `service::reconcile_orphan_rule` handles
-    /// it on every non-serving path.)
+    /// it on every non-serving path.) `gpo_nrpt_present` is `None` for the
+    /// different reason that this constructor reads nothing live; every
+    /// real status goes through `WebProtectionHandle::status`, which does.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
             nrpt_installed: None,
+            gpo_nrpt_present: None,
             state: ProxyState::Disabled,
             listen: None,
             upstreams: Vec::new(),
@@ -103,6 +115,28 @@ impl WebProtectionStatus {
             upstream_errors: 0,
         }
     }
+}
+
+/// Map the registry read to the tri-state the status surface reports.
+///
+/// Split from the live read so the mapping is unit-testable (the registry
+/// is not) — the same narrow-seam shape as `rule::installed_now`. THE ONE
+/// RULE: `Err` maps to `None` — "could not tell" — and must NEVER collapse
+/// to `Some(false)`. Reporting "no GPO" on the strength of an access error
+/// is how the GUI ends up claiming filtering on a machine where the OS
+/// ignores our rule.
+pub(crate) fn gpo_nrpt_present_from(read: Result<bool, nrpt::Error>) -> Option<bool> {
+    read.ok()
+}
+
+/// Live read of GPO NRPT presence for the status surface.
+///
+/// Read per status call rather than cached: it is one registry key open
+/// plus a subkey listing (cheap at the GUI's 10 s poll cadence), GPO state
+/// can change mid-session (gpupdate, domain join/leave), and a TTL cache
+/// would add a second source of truth for no measurable win.
+pub(crate) fn gpo_nrpt_present_now() -> Option<bool> {
+    gpo_nrpt_present_from(nrpt::gpo_nrpt_present())
 }
 
 #[cfg(test)]
@@ -125,9 +159,16 @@ mod tests {
             "unknown NRPT state must serialize as null, got {}",
             v["nrpt_installed"]
         );
+        // Same contract for the GPO fact: null, NOT false.
+        assert!(
+            v["gpo_nrpt_present"].is_null(),
+            "unknown GPO state must serialize as null, got {}",
+            v["gpo_nrpt_present"]
+        );
         assert_eq!(v["state"], serde_json::json!("disabled"));
         for k in [
             "listen",
+            "gpo_nrpt_present",
             "upstreams",
             "upstreams_healthy",
             "upstreams_total",
@@ -158,5 +199,29 @@ mod tests {
             s.nrpt_installed, None,
             "unknown must not be reported as not-installed"
         );
+        assert_eq!(
+            s.gpo_nrpt_present, None,
+            "a constructor that reads nothing live must not claim a GPO fact either"
+        );
+    }
+
+    /// THE property the GPO seam exists for: a read error is a third state,
+    /// never "absent". Collapsing `Err` to `Some(false)` would let the GUI
+    /// report filtering on a machine whose GPO policy makes our rule inert —
+    /// exactly the silent degrade the design doc forbids.
+    #[test]
+    fn gpo_nrpt_tri_state_never_collapses_error_to_absent() {
+        assert_eq!(gpo_nrpt_present_from(Ok(true)), Some(true));
+        assert_eq!(gpo_nrpt_present_from(Ok(false)), Some(false));
+        for e in [
+            nrpt::Error::AccessDenied("denied".into()),
+            nrpt::Error::Registry("boom".into()),
+        ] {
+            assert_eq!(
+                gpo_nrpt_present_from(Err(e)),
+                None,
+                "a read error is 'could not tell', not 'no GPO'"
+            );
+        }
     }
 }

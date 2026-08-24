@@ -128,6 +128,22 @@ export function WebProtectionPage() {
         </div>
       </Card>
 
+      {/* GPO NRPT present — the OS evaluates the GPO table INSTEAD of
+          local rules, so an installed rule filters NOTHING. `=== true`
+          only: null/undefined (could not tell, or an older daemon) must
+          never claim this. */}
+      {s.gpo_nrpt_present === true && (
+        <Card className="border-[rgb(var(--amber))]/25">
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={16} className="mt-0.5 flex-shrink-0 text-[rgb(var(--amber))]" />
+            <div>
+              <p className="text-[13px] font-semibold text-[rgb(var(--amber))]">{t("wp.gpo_title")}</p>
+              <p className="text-[12px] leading-relaxed text-[rgb(var(--t2))] mt-1">{t("wp.gpo_desc")}</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* NRPT rule — the FACT of whether system DNS goes through us.
           Three states, deliberately: live / absent / unknown. */}
       <Card>

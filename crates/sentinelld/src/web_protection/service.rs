@@ -166,6 +166,11 @@ impl WebProtectionHandle {
             // Read from the system, never inferred from config. `None`
             // still means "could not tell", which is not `Some(false)`.
             nrpt_installed: super::rule::installed_now(self.rule_guid.as_deref()),
+            // Live, like nrpt_installed, and through the same tri-state
+            // seam (read error = None, never Some(false)): GPO state can
+            // change mid-session and decides whether an installed rule
+            // filters anything at all.
+            gpo_nrpt_present: super::status::gpo_nrpt_present_now(),
             state: self.state,
             listen: self.listen.map(|a| a.to_string()),
             upstreams: upstreams.iter().map(|a| a.to_string()).collect(),
@@ -506,6 +511,28 @@ impl WebProtection {
             tx.subscribe(),
         );
         let task = tokio::spawn(proxy.run(rx));
+
+        // GPO NRPT rules (HKLM\...\DNSClient\DnsPolicyConfig) make local
+        // rules INERT: the OS evaluates the GPO table instead and no query
+        // reaches this proxy. Do NOT refuse to run — GPO state can change
+        // under us (gpupdate, domain join/leave), and surfacing rather
+        // than blocking is the design ("don't silently degrade",
+        // WEB_PROTECTION_DESIGN.md) — but say it loudly, or this daemon
+        // self-tests green, installs its rule, reports Serving, and
+        // filters nothing.
+        match nrpt::gpo_nrpt_present() {
+            Ok(true) => warn!(
+                "web protection: GPO DNS policy (NRPT) rules are present — Windows IGNORES local \
+                 NRPT rules on this machine, so web protection is INEFFECTIVE even though the \
+                 rule installs and the proxy serves (surfaced in status as gpo_nrpt_present)"
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                %e,
+                "web protection: could not read the GPO DNS policy container — cannot tell \
+                 whether local NRPT rules are inert on this machine"
+            ),
+        }
 
         // ONLY NOW, with the self-test passed and the listener serving, may
         // a rule be installed. `install` enforces the other hard

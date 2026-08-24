@@ -135,6 +135,15 @@ export interface WebProtectionStatus {
    * unaffected. Absent from older daemons — treat undefined as false.
    */
   watchdog_fired?: boolean;
+  /**
+   * ADDITIVE (daemon wave-2): GPO NRPT rules present on the machine RIGHT
+   * NOW. When true the OS evaluates the GPO table INSTEAD of local rules —
+   * our rule can show installed and the proxy serving while no query ever
+   * reaches it, so `true` MUST override any "filtering" rendering. `null`
+   * = the daemon could not tell (never render as "no GPO"). Absent from
+   * older daemons — treat undefined as null.
+   */
+  gpo_nrpt_present?: boolean | null;
   /** Rules loaded into the filter engine. */
   rules_loaded: number;
   /**
