@@ -180,7 +180,8 @@ export const getWatcherStatus = () =>
 
 // ── Web Protection ───────────────────────────────────────────
 
-/** Read-only: there is no setter — enabling is via sentinelld.toml + daemon restart. */
+/** Status is read-only here; mutations go through the elevated
+ *  protection.set_critical path (config is DaemonRestart-classified). */
 export const getWebProtectionStatus = () =>
   invoke<WebProtectionStatus>("get_web_protection_status");
 

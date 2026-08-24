@@ -196,7 +196,7 @@ pub const CRITICAL_FIELDS: &[&str] = &[
     // blocklists/allowlist are the filtering equivalent of
     // excluded_detections/trusted_hashes: emptying blocklists or
     // allowlisting a malicious domain is detection suppression. The
-    // remaining knobs travel with the section so a future
+    // remaining knobs travel with the section so the
     // protection.set_critical handler applies it atomically instead of
     // as split-brain halves.
     "web_protection.enabled",

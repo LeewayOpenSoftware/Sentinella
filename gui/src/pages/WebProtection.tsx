@@ -15,12 +15,25 @@ const STATE_META: Record<ProxyState, { labelKey: string; color: string }> = {
   disabled: { labelKey: "wp.state_disabled", color: "var(--t3)" },
 };
 
+/** Unknown future ProxyState variant — a newer daemon must never white-screen this page. */
+const FALLBACK_META = { labelKey: "wp.state_unknown", color: "var(--t3)" };
+
 /**
- * Web protection status page. READ-ONLY on purpose: there is no hot
- * enable/disable path in the daemon (protection.set_critical has no
- * web_protection branch), so the only mutation is editing
- * [web_protection] in sentinelld.toml and restarting the daemon — the
- * footer card says exactly that instead of offering a dead toggle.
+ * DaemonError's Display (gui/src-tauri/src/daemon_client.rs) formats RPC
+ * failures as "RPC error {code}: {message}"; no numeric code is plumbed
+ * through invoke, so the page matches on that stable prefix. -32601 is
+ * "unknown method" — the daemon predates webprotection.status.
+ */
+function isUnknownMethodError(err: string): boolean {
+  return err.includes("RPC error -32601");
+}
+
+/**
+ * Web protection status page. READ-ONLY in this wave: the daemon accepts
+ * web_protection.* mutations through protection.set_critical, but every
+ * field is DaemonRestart-classified (nothing hot-applies) and no toggle
+ * UI is built here yet — the footer card still points at sentinelld.toml
+ * + daemon restart instead of offering a dead toggle.
  *
  * The page renders INTENT (`enabled`, what config asked for) and FACT
  * (`nrpt_installed`, whether the system DNS rule exists right now) as
@@ -54,16 +67,23 @@ export function WebProtectionPage() {
   }
 
   if (err && !status) {
+    // The daemon WAS reached but predates webprotection.status — say so
+    // instead of the generic "could not reach" lie.
+    const outdated = isUnknownMethodError(err);
     return (
       <Card className="text-center py-10">
         <WifiOff size={20} className="mx-auto text-[rgb(var(--amber))] mb-3" />
-        <p className="text-[13px] text-[rgb(var(--t3))]">{t("wp.error")}</p>
+        <p className="text-[13px] text-[rgb(var(--t3))]">
+          {t(outdated ? "wp.error_outdated" : "wp.error")}
+        </p>
       </Card>
     );
   }
 
   const s = status!;
-  const meta = STATE_META[s.state];
+  // `?? FALLBACK_META`: STATE_META covers today's four ProxyState variants;
+  // a newer daemon can add one, and indexing it must not throw during render.
+  const meta = STATE_META[s.state] ?? FALLBACK_META;
   const cv = meta.color;
 
   return (

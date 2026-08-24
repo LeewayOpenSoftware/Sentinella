@@ -669,9 +669,12 @@ fn json_merge_in_place(base: &mut serde_json::Value, overlay: &serde_json::Value
 ///    Every entry of `proto::full_config::CRITICAL_FIELDS` is restored from
 ///    `current` below — the `settings_set_pins_every_critical_field` test
 ///    walks that list and fails if a future addition is missed.
-///    `[web_protection]` is pinned too: it is absent from `FullConfig`, so it
-///    has no IPC mutation path at all by design, and letting `settings.set`
-///    write it would be the only way to disable DNS filtering over IPC.
+///    `[web_protection]` is pinned too. It IS bridged into `FullConfig`
+///    (as an `Option`) and every `web_protection.*` path is in
+///    `CRITICAL_FIELDS`, so the elevated `protection.set_critical`
+///    handler is the one IPC mutation path for it. Letting plain
+///    `settings.set` write the section would be an UNELEVATED way to
+///    reroute or disable the machine's DNS filtering.
 fn settings_set_merge(
     current: &crate::config::Config,
     params: &serde_json::Value,
@@ -734,8 +737,11 @@ fn settings_set_merge(
     config.sandbox.enabled = current.sandbox.enabled;
     config.clamav_isolation = current.clamav_isolation.clone();
 
-    // ☠️ No IPC mutation path exists for [web_protection] (FullConfig does
-    // not mirror it), so settings.set must not become one.
+    // ☠️ [web_protection] is CRITICAL end-to-end: the elevated
+    // protection.set_critical handler is its one IPC mutation path.
+    // settings.set is the UNELEVATED path, so it must never write the
+    // section — it would be a way to reroute or silently disable DNS
+    // filtering without a challenge token or elevation.
     config.web_protection = current.web_protection.clone();
 
     // ☠️ KILL VECTOR FIX: preserve developer-mode password hash.
@@ -749,6 +755,601 @@ fn settings_set_merge(
     config.developer.password_sha256 = current.developer.password_sha256.clone();
 
     Ok(config)
+}
+
+// ─── protection.set_critical — pure param application ────────────────
+
+/// Outcome of [`apply_set_critical_params`]. The dispatch arm owns every
+/// side effect; this struct carries only what the arm needs to finish.
+struct SetCriticalApply {
+    /// Human-readable applied changes, for the activity log and the reply.
+    changes: Vec<String>,
+    /// Non-empty = reject the whole request with INVALID_PARAMS, unchanged.
+    errors: Vec<String>,
+    /// Deferred realtime on/off toggle — applied by the arm AFTER the save
+    /// (start_watcher re-reads the file, so toggling earlier would race it).
+    realtime_toggle: Option<bool>,
+    /// True when any `web_protection.*` key was present in the request.
+    /// Drives `restart_required: true` in the Ok payload: the section is
+    /// consumed once at daemon start (main.rs) and every field is
+    /// classified DaemonRestart (proto::full_config::restart_requirement),
+    /// so NOTHING below hot-applies and the caller must be told.
+    web_protection_touched: bool,
+}
+
+/// The pure half of the `protection.set_critical` handler: apply every
+/// recognised param key onto a config, validating strictly. No IO and no
+/// `AppState` — the arm keeps the token gate, the write lock, the load,
+/// the activity log, the save and every post-save side effect, so this
+/// function is unit-testable (a full in-process daemon harness is
+/// impractical; see the note in ipc/policy.rs).
+///
+/// Two cross-cutting rules live here rather than in the arm:
+///
+/// 1. **Unknown-key rejection.** Every branch reads its keys through the
+///    `param!` macro, which records the key as handled; afterwards any
+///    request key never recorded (other than the `token`/`auth` envelope)
+///    is an error. An unmatched param used to fall through to
+///    `ok:true, changes:[]` — reporting a setting applied that never was.
+///    Rejecting unknown keys is what makes that lie impossible for every
+///    future caller, not just the ones we know about. Verified callers
+///    (GUI `set_critical_protection` / `set_critical_settings`,
+///    sentinella-cli realtime toggle) send only keys handled below.
+///
+/// 2. **Transactional application.** Mutations happen on a clone and are
+///    written back ONLY when `errors` is empty, so "rejected = nothing
+///    changed" is true of the in-memory config too, not just of the disk
+///    file the arm never reaches on failure.
+fn apply_set_critical_params(
+    config: &mut crate::config::Config,
+    params: &serde_json::Value,
+) -> SetCriticalApply {
+    let mut work = config.clone();
+    let mut changes = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut realtime_toggle: Option<bool> = None;
+    let mut web_protection_touched = false;
+
+    // Keys this request carried that some branch actually looked at,
+    // pre-seeded with the IPC envelope. The unknown-key sweep at the
+    // bottom rejects everything else.
+    let mut handled: std::collections::HashSet<&'static str> =
+        ["token", "auth"].into_iter().collect();
+    // Read a param key and mark it as handled for the unknown-key sweep.
+    macro_rules! param {
+        ($key:literal) => {{
+            handled.insert($key);
+            params.get($key)
+        }};
+    }
+
+    // ── Validation helpers ──
+    const MAX_LIST_ENTRIES: usize = 64;
+    const MAX_PATH_LEN: usize = 4096;
+    // Hard-blocked paths: protect users from accidentally
+    // excluding the world or feeding the watcher a path that
+    // hangs the recursion.
+    // Delegates to crate::config so there is ONE list, not two.
+    // This used to be an inline copy and the copies diverged: this
+    // one never gained "c:\users", so protection.set_critical
+    // accepted that exclusion, reported changes=["excluded_paths=[1]"],
+    // and Config::validate then dropped it on save. The admin was
+    // told a setting applied that never did.
+    fn is_dangerous_path(p: &str) -> bool {
+        crate::config::is_dangerous_excluded_path(p)
+    }
+    fn is_hex64_lower(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    fn validate_string_list<F: Fn(&str) -> Result<(), String>>(
+        key: &str,
+        v: &serde_json::Value,
+        check: F,
+        errors: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let arr = v.as_array()?;
+        if arr.len() > MAX_LIST_ENTRIES {
+            errors.push(format!(
+                "{key}: too many entries ({} > {MAX_LIST_ENTRIES})",
+                arr.len()
+            ));
+            return None;
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            match item.as_str() {
+                Some(s) => match check(s) {
+                    Ok(()) => out.push(s.to_string()),
+                    Err(why) => errors.push(format!("{key}[{i}]: {why}")),
+                },
+                None => errors.push(format!("{key}[{i}]: not a string")),
+            }
+        }
+        Some(out)
+    }
+
+    // ── Existing fields (v0.1.7) ───────────────────
+    // The runtime side effect is DEFERRED to after config.save()
+    // succeeds — see `realtime_toggle` in the dispatch arm.
+    // Applying it here meant a request that failed validation (or
+    // failed to save) still stopped the watcher, leaving real-time
+    // protection down with config.toml and the GUI both still saying
+    // it was up. It also meant enable_protection() → start_watcher()
+    // re-read realtime_roots off disk BEFORE this handler wrote the
+    // new roots, so a save that both re-enabled protection and added
+    // a watched folder started the watcher on the old root set.
+    if let Some(v) = param!("realtime_enabled").and_then(|v| v.as_bool()) {
+        work.realtime_enabled = v;
+        changes.push(format!("realtime_enabled={v}"));
+        realtime_toggle = Some(v);
+    }
+    if let Some(v) = param!("auto_quarantine").and_then(|v| v.as_bool()) {
+        work.auto_quarantine = v;
+        changes.push(format!("auto_quarantine={v}"));
+    }
+
+    // ── New bool kill-vector toggles (v0.1.8) ──────
+    if let Some(v) = param!("heuristic_alerts").and_then(|v| v.as_bool()) {
+        work.heuristic_alerts = v;
+        changes.push(format!("heuristic_alerts={v}"));
+    }
+    if let Some(v) = param!("idle_scan_enabled").and_then(|v| v.as_bool()) {
+        work.idle_scan_enabled = v;
+        changes.push(format!("idle_scan_enabled={v}"));
+    }
+    if let Some(v) = param!("scheduled_scan_enabled").and_then(|v| v.as_bool()) {
+        work.scheduled_scan_enabled = v;
+        changes.push(format!("scheduled_scan_enabled={v}"));
+    }
+    if let Some(v) = param!("argus_worker_enabled").and_then(|v| v.as_bool()) {
+        work.argus_worker_enabled = v;
+        // Keep the [scan] mirror in sync — orchestrator reads both.
+        work.scan.argus_worker_enabled = v;
+        changes.push(format!("argus_worker_enabled={v}"));
+    }
+
+    // ── String kill-vectors with validation ────────
+    if let Some(v) = param!("enhanced_signature_provider").and_then(|v| v.as_str()) {
+        // Strict allowlist — anything else is an engine-swap kill
+        // vector. THE SAME predicate Config::validate uses: this had
+        // its own list (none|enhanced|community) that overlapped
+        // validate's only at "none", so real providers were rejected
+        // and the two accepted names were silently reset to "none"
+        // after being reported as a successful change.
+        if crate::config::is_known_signature_provider(v) {
+            work.enhanced_signature_provider = v.to_string();
+            changes.push(format!("enhanced_signature_provider={v}"));
+        } else {
+            errors.push(format!(
+                "enhanced_signature_provider={v:?} not in allowlist                          (none|securiteinfo|urlhaus|malwarepatrol)"
+            ));
+        }
+    }
+    if let Some(v) = param!("argus_worker_path").and_then(|v| v.as_str()) {
+        // Must look like a plausible executable path.
+        let trimmed = v.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_PATH_LEN {
+            errors.push("argus_worker_path: empty or too long".into());
+        } else if is_dangerous_path(trimmed) || trimmed.contains("..") {
+            errors.push(format!(
+                "argus_worker_path={trimmed:?} rejected (dangerous or traversal)"
+            ));
+        } else if !trimmed.to_lowercase().ends_with(".exe") {
+            errors.push(format!("argus_worker_path={trimmed:?} must end with .exe"));
+        } else {
+            work.argus_worker_path = trimmed.into();
+            work.scan.argus_worker_path = trimmed.into();
+            changes.push(format!("argus_worker_path={trimmed}"));
+        }
+    }
+
+    // ── v0.1.9 newly-critical fields (audit HIGH-2 / LOW-19) ──
+    //
+    // fish.enabled / fish.observe_only / fish.active_response /
+    // sandbox.enabled / clamav_isolation moved into CRITICAL_FIELDS;
+    // they now travel through this handler with the same elevated-
+    // caller + challenge-token gate as the other kill-vectors.
+    if let Some(v) = param!("fish.enabled").and_then(|v| v.as_bool()) {
+        work.fish.enabled = v;
+        changes.push(format!("fish.enabled={v}"));
+    }
+    if let Some(v) = param!("fish.observe_only").and_then(|v| v.as_bool()) {
+        work.fish.observe_only = v;
+        changes.push(format!("fish.observe_only={v}"));
+    }
+    if let Some(v) = param!("fish.active_response").and_then(|v| v.as_str()) {
+        // Strict allowlist — anything else would be a kill primitive
+        // (terminate / unknown values that fall back to observe and
+        // silently disable enforcement).
+        if matches!(v, "observe" | "suspend" | "terminate") {
+            work.fish.active_response = v.to_string();
+            changes.push(format!("fish.active_response={v}"));
+        } else {
+            errors.push(format!(
+                "fish.active_response={v:?} not in allowlist (observe|suspend|terminate)"
+            ));
+        }
+    }
+    if let Some(v) = param!("sandbox.enabled").and_then(|v| v.as_bool()) {
+        work.sandbox.enabled = v;
+        changes.push(format!("sandbox.enabled={v}"));
+    }
+    if let Some(v) = param!("clamav_isolation").and_then(|v| v.as_str()) {
+        // Strict allowlist (also enforced in Config::validate, but
+        // surfacing the error here gives the GUI a clear rejection
+        // instead of a silent reset to "in_process").
+        if matches!(v, "in_process" | "subprocess") {
+            work.clamav_isolation = v.to_string();
+            changes.push(format!("clamav_isolation={v}"));
+        } else {
+            errors.push(format!(
+                "clamav_isolation={v:?} not in allowlist (in_process|subprocess)"
+            ));
+        }
+    }
+
+    // ── web_protection.* — DNS filtering kill-vectors ──
+    //
+    // Flat dotted keys, matching the fish.enabled / sandbox.enabled
+    // precedent; all eight fields of CRITICAL_FIELDS' web_protection
+    // block. STRICTLY TYPED: a present key with the wrong JSON type is
+    // an error, never a silent no-op. Per-key validation feeds the
+    // arm's all-or-nothing hard-fail; the composite gate at the bottom
+    // then judges the merged section as a whole.
+    //
+    // Polarity, per web_protection::config's module docs: turning the
+    // proxy ON when it cannot serve is the harm, turning it OFF is the
+    // emergency fix — so nothing here may coerce a bad value into a
+    // plausible one, and `enabled=false` is always accepted.
+    {
+        let wp = &mut work.web_protection;
+
+        if let Some(v) = param!("web_protection.enabled") {
+            web_protection_touched = true;
+            match v.as_bool() {
+                Some(b) => {
+                    wp.enabled = b;
+                    changes.push(format!("web_protection.enabled={b}"));
+                }
+                None => errors.push("web_protection.enabled: must be a boolean".into()),
+            }
+        }
+        if let Some(v) = param!("web_protection.listen") {
+            web_protection_touched = true;
+            match v.as_str() {
+                Some(s) => {
+                    let t = s.trim();
+                    if t.is_empty() || t.len() > 128 {
+                        errors.push("web_protection.listen: empty or too long".into());
+                    } else if t.parse::<std::net::SocketAddr>().is_err() {
+                        // Rejected even while disabled: storing a listen
+                        // that can never parse only defers the failure to
+                        // the next enable attempt.
+                        errors.push(format!(
+                            "web_protection.listen={t:?} is not a valid IP:port"
+                        ));
+                    } else {
+                        wp.listen = t.to_string();
+                        changes.push(format!("web_protection.listen={t}"));
+                    }
+                }
+                None => errors.push("web_protection.listen: must be a string".into()),
+            }
+        }
+        if let Some(v) = param!("web_protection.upstreams") {
+            web_protection_touched = true;
+            if !v.is_array() {
+                errors.push("web_protection.upstreams: must be an array of strings".into());
+            } else if let Some(list) = validate_string_list(
+                "web_protection.upstreams",
+                v,
+                |s| {
+                    let t = s.trim();
+                    if t == crate::web_protection::config::UPSTREAM_SYSTEM {
+                        return Ok(());
+                    }
+                    if t.is_empty() {
+                        return Err("empty entry".into());
+                    }
+                    t.parse::<std::net::SocketAddr>()
+                        .map(|_| ())
+                        .map_err(|_| format!("{t:?} is neither \"system\" nor a valid IP:port"))
+                },
+                &mut errors,
+            ) {
+                wp.upstreams = list;
+                changes.push(format!("web_protection.upstreams=[{}]", wp.upstreams.len()));
+            }
+        }
+        if let Some(v) = param!("web_protection.block_response") {
+            web_protection_touched = true;
+            match v.as_str() {
+                Some(s)
+                    if s == crate::web_protection::config::BLOCK_RESPONSE_NXDOMAIN
+                        || s == crate::web_protection::config::BLOCK_RESPONSE_ZERO_IP =>
+                {
+                    wp.block_response = s.to_string();
+                    changes.push(format!("web_protection.block_response={s}"));
+                }
+                Some(s) => errors.push(format!(
+                    "web_protection.block_response={s:?} not in allowlist (nxdomain|zero_ip)"
+                )),
+                None => errors.push("web_protection.block_response: must be a string".into()),
+            }
+        }
+        if let Some(v) = param!("web_protection.health_check_name") {
+            web_protection_touched = true;
+            match v.as_str() {
+                Some(s) => {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        errors.push("web_protection.health_check_name: empty".into());
+                    } else if t.len() > 253 {
+                        errors.push(
+                            "web_protection.health_check_name: longer than any legal DNS name"
+                                .into(),
+                        );
+                    } else if t.contains('\\') {
+                        // Same reason as WebProtectionConfig::check_enablable:
+                        // dnsguard's query builder is escape-unaware, so a
+                        // backslash would silently probe a different name.
+                        errors.push(format!(
+                            "web_protection.health_check_name={t:?} contains a backslash escape"
+                        ));
+                    } else {
+                        wp.health_check_name = t.to_string();
+                        changes.push(format!("web_protection.health_check_name={t}"));
+                    }
+                }
+                None => errors.push("web_protection.health_check_name: must be a string".into()),
+            }
+        }
+        if let Some(v) = param!("web_protection.blocklists") {
+            web_protection_touched = true;
+            if !v.is_array() {
+                errors.push("web_protection.blocklists: must be an array of strings".into());
+            } else if let Some(list) = validate_string_list(
+                "web_protection.blocklists",
+                v,
+                |s| {
+                    let t = s.trim();
+                    // Entry syntax: `path`, `path|exact` or `path|suffix`
+                    // ('|' cannot appear in a Windows path, so the first
+                    // one is unambiguous). An unknown policy token is an
+                    // ERROR here, not service.rs's warn-and-use-exact:
+                    // over IPC, silently substituting the policy would
+                    // report a filtering semantic the engine never got.
+                    let (path, policy) = match t.split_once('|') {
+                        Some((p, pol)) => (p.trim(), Some(pol)),
+                        None => (t, None),
+                    };
+                    if path.is_empty() {
+                        return Err("empty path".into());
+                    }
+                    if path.len() > MAX_PATH_LEN {
+                        return Err("path too long".into());
+                    }
+                    match policy {
+                        None | Some("exact") | Some("suffix") => Ok(()),
+                        Some(other) => Err(format!(
+                            "unknown policy {other:?} (expected exact|suffix)"
+                        )),
+                    }
+                },
+                &mut errors,
+            ) {
+                wp.blocklists = list;
+                changes.push(format!("web_protection.blocklists=[{}]", wp.blocklists.len()));
+            }
+        }
+        if let Some(v) = param!("web_protection.allowlist") {
+            web_protection_touched = true;
+            if !v.is_array() {
+                errors.push("web_protection.allowlist: must be an array of strings".into());
+            } else if let Some(list) = validate_string_list(
+                "web_protection.allowlist",
+                v,
+                |s| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        return Err("empty entry".into());
+                    }
+                    if t.len() > 253 {
+                        return Err("entry longer than any legal DNS name".into());
+                    }
+                    if t.chars().any(|c| c.is_whitespace()) || t.contains('\\') {
+                        // A name with spaces or a backslash can never
+                        // match a query name — storing it would be a
+                        // rule that silently does nothing.
+                        return Err("whitespace and backslashes are not valid in a DNS name".into());
+                    }
+                    Ok(())
+                },
+                &mut errors,
+            ) {
+                wp.allowlist = list;
+                changes.push(format!("web_protection.allowlist=[{}]", wp.allowlist.len()));
+            }
+        }
+        if let Some(v) = param!("web_protection.log_queries") {
+            web_protection_touched = true;
+            match v.as_bool() {
+                Some(b) => {
+                    wp.log_queries = b;
+                    changes.push(format!("web_protection.log_queries={b}"));
+                }
+                None => errors.push("web_protection.log_queries: must be a boolean".into()),
+            }
+        }
+
+        // Composite gate — reject, never silently disable. Runs on the
+        // FINAL merged section whenever the result is enabled=true, even
+        // when the request never mentioned `enabled`: a listen-only
+        // change against a stored enabled=true must still prove the
+        // result can serve. Deliberately NOT delegated to
+        // Config::validate() (the arm calls it before saving): validate
+        // would force enabled=false with only a warn!, turning a
+        // reported success into the silent-reset lie. An enabled=false
+        // result skips the gate entirely — turning the proxy OFF is the
+        // emergency fix and is always allowed.
+        if wp.enabled {
+            if let Err(reason) = wp.check_enablable() {
+                errors.push(format!(
+                    "web_protection: refusing to save enabled=true with an unservable config — {reason}"
+                ));
+            }
+        }
+    }
+
+    // ── List kill-vectors with validation ──────────
+    if let Some(v) = param!("excluded_paths") {
+        if let Some(list) = validate_string_list(
+            "excluded_paths",
+            v,
+            |s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    Err("empty entry".into())
+                } else if t.len() > MAX_PATH_LEN {
+                    Err("path too long".into())
+                } else if is_dangerous_path(t) {
+                    Err(format!("{t:?} would exclude critical system area"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut errors,
+        ) {
+            work.excluded_paths = list;
+            changes.push(format!("excluded_paths=[{}]", work.excluded_paths.len()));
+        }
+    }
+    if let Some(v) = param!("excluded_extensions") {
+        if let Some(list) = validate_string_list(
+            "excluded_extensions",
+            v,
+            |s| {
+                let t = s.trim().trim_start_matches('.');
+                if t.is_empty() {
+                    Err("empty entry".into())
+                } else if t.len() > 16 {
+                    Err("extension too long".into())
+                } else if t.contains('*') || t.contains('?') || t.contains('\\') || t.contains('/') {
+                    Err("globs and path separators rejected".into())
+                } else if !t.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    Err("extension must be ASCII alphanumeric".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut errors,
+        ) {
+            // Normalize: strip dots, lowercase.
+            let norm: Vec<String> = list
+                .into_iter()
+                .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+                .collect();
+            work.excluded_extensions = norm;
+            changes.push(format!(
+                "excluded_extensions=[{}]",
+                work.excluded_extensions.len()
+            ));
+        }
+    }
+    if let Some(v) = param!("excluded_detections") {
+        if let Some(list) = validate_string_list(
+            "excluded_detections",
+            v,
+            |s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    // R4-C1: empty entry would suppress ALL detections — kill switch.
+                    Err("empty entry rejected (would silence ALL detections)".into())
+                } else if t.len() > 256 {
+                    Err("detection name too long".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut errors,
+        ) {
+            work.excluded_detections = list;
+            changes.push(format!(
+                "excluded_detections=[{}]",
+                work.excluded_detections.len()
+            ));
+        }
+    }
+    if let Some(v) = param!("trusted_hashes") {
+        if let Some(list) = validate_string_list(
+            "trusted_hashes",
+            v,
+            |s| {
+                let t = s.trim().to_lowercase();
+                if !is_hex64_lower(&t) {
+                    Err("must be 64-char lowercase hex SHA-256".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut errors,
+        ) {
+            let norm: Vec<String> = list.into_iter().map(|s| s.trim().to_lowercase()).collect();
+            work.trusted_hashes = norm;
+            changes.push(format!("trusted_hashes=[{}]", work.trusted_hashes.len()));
+        }
+    }
+    if let Some(v) = param!("realtime_roots") {
+        if let Some(list) = validate_string_list(
+            "realtime_roots",
+            v,
+            |s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    Err("empty entry".into())
+                } else if t.len() > MAX_PATH_LEN {
+                    Err("path too long".into())
+                } else if is_dangerous_path(t) {
+                    Err(format!(
+                        "{t:?} is too broad — would hang the watcher in reparse loops"
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut errors,
+        ) {
+            work.realtime_roots = list;
+            changes.push(format!("realtime_roots=[{}]", work.realtime_roots.len()));
+        }
+    }
+
+    // ── Unknown-key sweep ──
+    // Any request key no branch looked at (token/auth pre-seeded above)
+    // is a typo'd or fabricated field. Answering ok:true for it would be
+    // the "applied but ignored" lie this handler was fixed for twice
+    // before — the typo'd `web_protection.enable` must be REJECTED, not
+    // ignored.
+    if let Some(obj) = params.as_object() {
+        for key in obj.keys() {
+            if !handled.contains(key.as_str()) {
+                errors.push(format!(
+                    "unknown parameter {key:?} — not a protection.set_critical field"
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        *config = work;
+    }
+
+    SetCriticalApply {
+        changes,
+        errors,
+        realtime_toggle,
+        web_protection_touched,
+    }
 }
 
 /// Synchronous dispatch — all handlers are sync (no async needed).
@@ -2602,11 +3203,18 @@ fn dispatch_sync(
         // path at all — they could ONLY be changed by editing the TOML file
         // directly. v0.1.8 fills that gap so the Settings UI can edit
         // exclusions, watched roots, trusted hashes, etc., still gated behind
-        // the challenge-token-plus-UAC defence.
+        // the challenge-token-plus-UAC defence. The eight web_protection.*
+        // keys joined later, with the same gate.
         //
         // Validation here is STRICT: anything that smells malformed gets
-        // rejected with an explicit reason rather than silently coerced. The
-        // GUI surfaces the reason inline next to the field.
+        // rejected with an explicit reason rather than silently coerced, and
+        // any param key no branch recognises is rejected too — an ignored
+        // key answered with ok:true is the "applied but never did" lie.
+        // The GUI surfaces the reason inline next to the field.
+        //
+        // All per-key branching lives in apply_set_critical_params (pure,
+        // unit-tested); this arm owns the token gate, the write lock, the
+        // load/save and every post-save side effect.
         "protection.set_critical" => {
             let token = req
                 .params
@@ -2626,331 +3234,22 @@ fn dispatch_sync(
             // parallel config writers (see AppState::lock_config_write).
             let _cfg_guard = state.lock_config_write();
             let mut config = crate::config::Config::load(None).unwrap_or_default();
-            let mut changes = Vec::new();
-            let mut errors: Vec<String> = Vec::new();
-
-            // ── Validation helpers (inline; v0.1.9 can refactor to mod::validation) ──
-            const MAX_LIST_ENTRIES: usize = 64;
-            const MAX_PATH_LEN: usize = 4096;
-            // Hard-blocked paths: protect users from accidentally
-            // excluding the world or feeding the watcher a path that
-            // hangs the recursion.
-            // Delegates to crate::config so there is ONE list, not two.
-            // This used to be an inline copy and the copies diverged: this
-            // one never gained "c:\users", so protection.set_critical
-            // accepted that exclusion, reported changes=["excluded_paths=[1]"],
-            // and Config::validate then dropped it on save. The admin was
-            // told a setting applied that never did.
-            fn is_dangerous_path(p: &str) -> bool {
-                crate::config::is_dangerous_excluded_path(p)
-            }
-            fn is_hex64_lower(s: &str) -> bool {
-                s.len() == 64
-                    && s.bytes()
-                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            }
-            fn validate_string_list<F: Fn(&str) -> Result<(), String>>(
-                key: &str,
-                v: &serde_json::Value,
-                check: F,
-                errors: &mut Vec<String>,
-            ) -> Option<Vec<String>> {
-                let arr = v.as_array()?;
-                if arr.len() > MAX_LIST_ENTRIES {
-                    errors.push(format!(
-                        "{key}: too many entries ({} > {MAX_LIST_ENTRIES})",
-                        arr.len()
-                    ));
-                    return None;
-                }
-                let mut out = Vec::with_capacity(arr.len());
-                for (i, item) in arr.iter().enumerate() {
-                    match item.as_str() {
-                        Some(s) => match check(s) {
-                            Ok(()) => out.push(s.to_string()),
-                            Err(why) => errors.push(format!("{key}[{i}]: {why}")),
-                        },
-                        None => errors.push(format!("{key}[{i}]: not a string")),
-                    }
-                }
-                Some(out)
-            }
-
-            // ── Existing fields (v0.1.7) ───────────────────
-            // The runtime side effect is DEFERRED to after config.save()
-            // succeeds — see `realtime_toggle` at the bottom of this arm.
-            // Applying it here meant a request that failed validation (or
-            // failed to save) still stopped the watcher, leaving real-time
-            // protection down with config.toml and the GUI both still saying
-            // it was up. It also meant enable_protection() → start_watcher()
-            // re-read realtime_roots off disk BEFORE this handler wrote the
-            // new roots, so a save that both re-enabled protection and added
-            // a watched folder started the watcher on the old root set.
-            let mut realtime_toggle: Option<bool> = None;
-            if let Some(v) = req.params.get("realtime_enabled").and_then(|v| v.as_bool()) {
-                config.realtime_enabled = v;
-                changes.push(format!("realtime_enabled={v}"));
-                realtime_toggle = Some(v);
-            }
-            if let Some(v) = req.params.get("auto_quarantine").and_then(|v| v.as_bool()) {
-                config.auto_quarantine = v;
-                changes.push(format!("auto_quarantine={v}"));
-            }
-
-            // ── New bool kill-vector toggles (v0.1.8) ──────
-            if let Some(v) = req.params.get("heuristic_alerts").and_then(|v| v.as_bool()) {
-                config.heuristic_alerts = v;
-                changes.push(format!("heuristic_alerts={v}"));
-            }
-            if let Some(v) = req.params.get("idle_scan_enabled").and_then(|v| v.as_bool()) {
-                config.idle_scan_enabled = v;
-                changes.push(format!("idle_scan_enabled={v}"));
-            }
-            if let Some(v) = req.params
-                .get("scheduled_scan_enabled")
-                .and_then(|v| v.as_bool())
-            {
-                config.scheduled_scan_enabled = v;
-                changes.push(format!("scheduled_scan_enabled={v}"));
-            }
-            if let Some(v) = req.params
-                .get("argus_worker_enabled")
-                .and_then(|v| v.as_bool())
-            {
-                config.argus_worker_enabled = v;
-                // Keep the [scan] mirror in sync — orchestrator reads both.
-                config.scan.argus_worker_enabled = v;
-                changes.push(format!("argus_worker_enabled={v}"));
-            }
-
-            // ── String kill-vectors with validation ────────
-            if let Some(v) = req.params
-                .get("enhanced_signature_provider")
-                .and_then(|v| v.as_str())
-            {
-                // Strict allowlist — anything else is an engine-swap kill
-                // vector. THE SAME predicate Config::validate uses: this had
-                // its own list (none|enhanced|community) that overlapped
-                // validate's only at "none", so real providers were rejected
-                // and the two accepted names were silently reset to "none"
-                // after being reported as a successful change.
-                if crate::config::is_known_signature_provider(v) {
-                    config.enhanced_signature_provider = v.to_string();
-                    changes.push(format!("enhanced_signature_provider={v}"));
-                } else {
-                    errors.push(format!(
-                        "enhanced_signature_provider={v:?} not in allowlist                          (none|securiteinfo|urlhaus|malwarepatrol)"
-                    ));
-                }
-            }
-            if let Some(v) = req.params.get("argus_worker_path").and_then(|v| v.as_str()) {
-                // Must look like a plausible executable path.
-                let trimmed = v.trim();
-                if trimmed.is_empty() || trimmed.len() > MAX_PATH_LEN {
-                    errors.push("argus_worker_path: empty or too long".into());
-                } else if is_dangerous_path(trimmed) || trimmed.contains("..") {
-                    errors.push(format!(
-                        "argus_worker_path={trimmed:?} rejected (dangerous or traversal)"
-                    ));
-                } else if !trimmed.to_lowercase().ends_with(".exe") {
-                    errors.push(format!(
-                        "argus_worker_path={trimmed:?} must end with .exe"
-                    ));
-                } else {
-                    config.argus_worker_path = trimmed.into();
-                    config.scan.argus_worker_path = trimmed.into();
-                    changes.push(format!("argus_worker_path={trimmed}"));
-                }
-            }
-
-            // ── v0.1.9 newly-critical fields (audit HIGH-2 / LOW-19) ──
-            //
-            // fish.enabled / fish.observe_only / fish.active_response /
-            // sandbox.enabled / clamav_isolation moved into CRITICAL_FIELDS;
-            // they now travel through this handler with the same elevated-
-            // caller + challenge-token gate as the other kill-vectors.
-            if let Some(v) = req.params.get("fish.enabled").and_then(|v| v.as_bool()) {
-                config.fish.enabled = v;
-                changes.push(format!("fish.enabled={v}"));
-            }
-            if let Some(v) = req.params.get("fish.observe_only").and_then(|v| v.as_bool()) {
-                config.fish.observe_only = v;
-                changes.push(format!("fish.observe_only={v}"));
-            }
-            if let Some(v) = req.params.get("fish.active_response").and_then(|v| v.as_str()) {
-                // Strict allowlist — anything else would be a kill primitive
-                // (terminate / unknown values that fall back to observe and
-                // silently disable enforcement).
-                if matches!(v, "observe" | "suspend" | "terminate") {
-                    config.fish.active_response = v.to_string();
-                    changes.push(format!("fish.active_response={v}"));
-                } else {
-                    errors.push(format!(
-                        "fish.active_response={v:?} not in allowlist (observe|suspend|terminate)"
-                    ));
-                }
-            }
-            if let Some(v) = req.params.get("sandbox.enabled").and_then(|v| v.as_bool()) {
-                config.sandbox.enabled = v;
-                changes.push(format!("sandbox.enabled={v}"));
-            }
-            if let Some(v) = req.params.get("clamav_isolation").and_then(|v| v.as_str()) {
-                // Strict allowlist (also enforced in Config::validate, but
-                // surfacing the error here gives the GUI a clear rejection
-                // instead of a silent reset to "in_process").
-                if matches!(v, "in_process" | "subprocess") {
-                    config.clamav_isolation = v.to_string();
-                    changes.push(format!("clamav_isolation={v}"));
-                } else {
-                    errors.push(format!(
-                        "clamav_isolation={v:?} not in allowlist (in_process|subprocess)"
-                    ));
-                }
-            }
-
-            // ── List kill-vectors with validation ──────────
-            if let Some(v) = req.params.get("excluded_paths") {
-                if let Some(list) = validate_string_list(
-                    "excluded_paths",
-                    v,
-                    |s| {
-                        let t = s.trim();
-                        if t.is_empty() {
-                            Err("empty entry".into())
-                        } else if t.len() > MAX_PATH_LEN {
-                            Err("path too long".into())
-                        } else if is_dangerous_path(t) {
-                            Err(format!("{t:?} would exclude critical system area"))
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    &mut errors,
-                ) {
-                    config.excluded_paths = list;
-                    changes.push(format!("excluded_paths=[{}]", config.excluded_paths.len()));
-                }
-            }
-            if let Some(v) = req.params.get("excluded_extensions") {
-                if let Some(list) = validate_string_list(
-                    "excluded_extensions",
-                    v,
-                    |s| {
-                        let t = s.trim().trim_start_matches('.');
-                        if t.is_empty() {
-                            Err("empty entry".into())
-                        } else if t.len() > 16 {
-                            Err("extension too long".into())
-                        } else if t.contains('*') || t.contains('?') || t.contains('\\') || t.contains('/') {
-                            Err("globs and path separators rejected".into())
-                        } else if !t.chars().all(|c| c.is_ascii_alphanumeric()) {
-                            Err("extension must be ASCII alphanumeric".into())
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    &mut errors,
-                ) {
-                    // Normalize: strip dots, lowercase.
-                    let norm: Vec<String> = list
-                        .into_iter()
-                        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-                        .collect();
-                    config.excluded_extensions = norm;
-                    changes.push(format!(
-                        "excluded_extensions=[{}]",
-                        config.excluded_extensions.len()
-                    ));
-                }
-            }
-            if let Some(v) = req.params.get("excluded_detections") {
-                if let Some(list) = validate_string_list(
-                    "excluded_detections",
-                    v,
-                    |s| {
-                        let t = s.trim();
-                        if t.is_empty() {
-                            // R4-C1: empty entry would suppress ALL detections — kill switch.
-                            Err("empty entry rejected (would silence ALL detections)".into())
-                        } else if t.len() > 256 {
-                            Err("detection name too long".into())
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    &mut errors,
-                ) {
-                    config.excluded_detections = list;
-                    changes.push(format!(
-                        "excluded_detections=[{}]",
-                        config.excluded_detections.len()
-                    ));
-                }
-            }
-            if let Some(v) = req.params.get("trusted_hashes") {
-                if let Some(list) = validate_string_list(
-                    "trusted_hashes",
-                    v,
-                    |s| {
-                        let t = s.trim().to_lowercase();
-                        if !is_hex64_lower(&t) {
-                            Err("must be 64-char lowercase hex SHA-256".into())
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    &mut errors,
-                ) {
-                    let norm: Vec<String> = list.into_iter().map(|s| s.trim().to_lowercase()).collect();
-                    config.trusted_hashes = norm;
-                    changes.push(format!(
-                        "trusted_hashes=[{}]",
-                        config.trusted_hashes.len()
-                    ));
-                }
-            }
-            if let Some(v) = req.params.get("realtime_roots") {
-                if let Some(list) = validate_string_list(
-                    "realtime_roots",
-                    v,
-                    |s| {
-                        let t = s.trim();
-                        if t.is_empty() {
-                            Err("empty entry".into())
-                        } else if t.len() > MAX_PATH_LEN {
-                            Err("path too long".into())
-                        } else if is_dangerous_path(t) {
-                            Err(format!(
-                                "{t:?} is too broad — would hang the watcher in reparse loops"
-                            ))
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    &mut errors,
-                ) {
-                    config.realtime_roots = list;
-                    changes.push(format!(
-                        "realtime_roots=[{}]",
-                        config.realtime_roots.len()
-                    ));
-                }
-            }
+            let applied = apply_set_critical_params(&mut config, &req.params);
 
             // Hard-fail if any field had a validation error — partial success
             // would leave the user wondering which field actually got applied.
-            if !errors.is_empty() {
+            if !applied.errors.is_empty() {
                 state.log_activity(
                     "warning",
                     "protection",
-                    &format!("protection.set_critical rejected: {}", errors.join("; ")),
+                    &format!("protection.set_critical rejected: {}", applied.errors.join("; ")),
                     "",
                     None,
                 );
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INVALID_PARAMS,
-                    format!("validation failed: {}", errors.join("; ")),
+                    format!("validation failed: {}", applied.errors.join("; ")),
                 ))
                 .unwrap_or_default();
             }
@@ -2966,7 +3265,7 @@ fn dispatch_sync(
                     state.log_activity(
                         "warning",
                         "protection",
-                        &format!("Critical settings changed: {}", changes.join(", ")),
+                        &format!("Critical settings changed: {}", applied.changes.join(", ")),
                         "Requires administrator elevation",
                         None,
                     );
@@ -2993,14 +3292,25 @@ fn dispatch_sync(
                     // elevated caller IS the request to resume, and gating it on
                     // !is_user_disabled() made re-enabling a no-op whenever the
                     // same handler (or protection.disable) had set that flag.
-                    if let Some(v) = realtime_toggle {
+                    if let Some(v) = applied.realtime_toggle {
                         if v {
                             state.enable_protection();
                         } else {
                             state.disable_protection();
                         }
                     }
-                    Ok(serde_json::json!({"ok": true, "changes": changes}))
+                    // web_protection.* is deliberately NOT hot-applied: the
+                    // section is consumed once at daemon start (main.rs) and
+                    // every field is classified DaemonRestart
+                    // (proto::full_config::restart_requirement) — a
+                    // half-applied DNS change is how an NRPT rule ends up
+                    // pointing at a dead listener. restart_required tells the
+                    // GUI to say so; additive, older GUIs ignore the key.
+                    let mut payload = serde_json::json!({"ok": true, "changes": applied.changes});
+                    if applied.web_protection_touched {
+                        payload["restart_required"] = serde_json::json!(true);
+                    }
+                    Ok(payload)
                 }
                 Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
             }
@@ -3520,6 +3830,374 @@ mod tests {
             merged.web_protection.allowlist,
             vec![".corp.example.com".to_string()]
         );
+    }
+
+    // ── protection.set_critical param application ────────────
+    //
+    // These exercise apply_set_critical_params, the pure half of the arm
+    // (the arm itself needs an AppState; ipc/policy.rs documents why a
+    // full in-process harness is impractical). The token gate is NOT
+    // covered here: it precedes the call to this function, applies to the
+    // whole method uniformly, and is pinned by state.rs's challenge-token
+    // tests — so a web_protection.* key without a token can never reach
+    // the code tested below.
+
+    /// Build a params object of the same flat shape the verified callers
+    /// send: a challenge token plus flat (possibly dotted) field keys.
+    fn set_critical_params(pairs: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("token".into(), serde_json::json!("challenge"));
+        for (k, v) in pairs {
+            map.insert((*k).to_string(), v.clone());
+        }
+        serde_json::Value::Object(map)
+    }
+
+    fn config_json(c: &crate::config::Config) -> serde_json::Value {
+        serde_json::to_value(c).expect("Config must serialize")
+    }
+
+    /// (i) enabled=true + garbage listen → error NAMING listen, and the
+    /// config is untouched (transactional apply — the arm hard-fails on
+    /// any error before save).
+    #[test]
+    fn set_critical_wp_enable_with_garbage_listen_rejected() {
+        let mut config = crate::config::Config::default();
+        let before = config_json(&config);
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[
+                ("web_protection.enabled", serde_json::json!(true)),
+                ("web_protection.listen", serde_json::json!("not-an-address")),
+            ]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("web_protection.listen") && e.contains("not a valid IP:port")),
+            "the error must name the key and the cause: {:?}",
+            applied.errors
+        );
+        assert_eq!(
+            config_json(&config),
+            before,
+            "a rejected request must leave the config untouched"
+        );
+    }
+
+    /// (ii) A valid enable applies: the section changes, the key appears
+    /// in `changes` for the activity log, and web_protection_touched is
+    /// set — the flag the arm turns into `restart_required: true` in the
+    /// Ok payload (nothing in web_protection hot-applies; DaemonRestart).
+    #[test]
+    fn set_critical_wp_valid_enable_applies() {
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[("web_protection.enabled", serde_json::json!(true))]),
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert!(config.web_protection.enabled);
+        assert!(applied.web_protection_touched);
+        assert!(
+            applied
+                .changes
+                .iter()
+                .any(|c| c == "web_protection.enabled=true"),
+            "changes must name the key: {:?}",
+            applied.changes
+        );
+    }
+
+    /// (iv) The typo'd key `web_protection.enable` must be REJECTED by the
+    /// unknown-key sweep, not ignored — ignoring it while answering
+    /// ok:true was the lie this sweep exists to close.
+    #[test]
+    fn set_critical_wp_typo_key_rejected_not_ignored() {
+        let mut config = crate::config::Config::default();
+        let before = config_json(&config);
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[("web_protection.enable", serde_json::json!(true))]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("unknown parameter") && e.contains("web_protection.enable")),
+            "the typo must be rejected as unknown: {:?}",
+            applied.errors
+        );
+        assert!(!config.web_protection.enabled);
+        assert_eq!(config_json(&config), before);
+    }
+
+    /// (v) Composite gate: a request that only sets listen, against a
+    /// stored enabled=true, must be judged on the MERGED result — a
+    /// non-53 port cannot serve through NRPT, so the request is rejected
+    /// even though it never mentioned `enabled`.
+    #[test]
+    fn set_critical_wp_listen_change_judged_against_stored_enabled() {
+        let mut config = crate::config::Config::default();
+        config.web_protection.enabled = true;
+        let before = config_json(&config);
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.listen",
+                serde_json::json!("127.0.0.1:5353"),
+            )]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("refusing to save enabled=true")),
+            "the composite gate must reject: {:?}",
+            applied.errors
+        );
+        assert_eq!(
+            config_json(&config),
+            before,
+            "rejected — the stored, servable config must survive"
+        );
+    }
+
+    /// (vi) A blocklists entry with an unknown policy token is an ERROR —
+    /// over IPC, service.rs's silent degrade-to-exact would report a
+    /// filtering semantic the engine never got.
+    #[test]
+    fn set_critical_wp_blocklist_unknown_policy_rejected() {
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.blocklists",
+                serde_json::json!(["C:\\feeds\\md.txt|prefix"]),
+            )]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("web_protection.blocklists") && e.contains("unknown policy")),
+            "{:?}",
+            applied.errors
+        );
+        assert!(config.web_protection.blocklists.is_empty());
+    }
+
+    /// (vii) The sweep rejects unknown keys on PRE-EXISTING config fields
+    /// too, not just web_protection typos: max_file_size_mb is a real
+    /// Config field that simply has no set_critical branch (it is not
+    /// critical), and scan.argus_worker_enabled is CRITICAL_FIELDS-listed
+    /// but mirrored by the argus_worker_enabled branch — neither may be
+    /// written through this method.
+    #[test]
+    fn set_critical_unknown_preexisting_fields_rejected() {
+        for key in ["max_file_size_mb", "scan.argus_worker_enabled"] {
+            let mut config = crate::config::Config::default();
+            let before = config_json(&config);
+            let applied = super::apply_set_critical_params(
+                &mut config,
+                &set_critical_params(&[(key, serde_json::json!(false))]),
+            );
+            assert!(
+                applied
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("unknown parameter") && e.contains(key)),
+                "{key} must be rejected, not ignored: {:?}",
+                applied.errors
+            );
+            assert_eq!(config_json(&config), before, "{key} must not apply");
+        }
+    }
+
+    /// (viii) The exact param shapes the GUI's two callers send must pass
+    /// the unknown-key sweep. Encoded from gui/src-tauri/src/lib.rs:
+    /// set_critical_protection sends token + realtime_enabled /
+    /// auto_quarantine only; set_critical_settings passes useFullConfig's
+    /// criticalDiff, whose keys come from the TS CRITICAL_FIELDS set and
+    /// are flat dotted paths (the scan.argus_worker_* entries of that set
+    /// are never sent — no Settings tab writes them, and the daemon
+    /// mirrors them from the top-level keys at save; grep-verified).
+    #[test]
+    fn set_critical_gui_caller_shapes_pass_the_sweep() {
+        // set_critical_protection shape.
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[
+                ("realtime_enabled", serde_json::json!(false)),
+                ("auto_quarantine", serde_json::json!(false)),
+            ]),
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert_eq!(applied.realtime_toggle, Some(false));
+
+        // set_critical_settings criticalDiff shape: flat dotted keys,
+        // including the web_protection.* block a future Settings UI sends.
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[
+                ("excluded_extensions", serde_json::json!(["scr"])),
+                ("fish.active_response", serde_json::json!("suspend")),
+                ("web_protection.block_response", serde_json::json!("zero_ip")),
+            ]),
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert_eq!(config.excluded_extensions, vec!["scr".to_string()]);
+        assert_eq!(config.fish.active_response, "suspend");
+        assert_eq!(config.web_protection.block_response, "zero_ip");
+        assert!(applied.web_protection_touched);
+    }
+
+    /// Polarity pin: turning web protection OFF is the emergency fix and
+    /// must always be accepted, even when the stored section could never
+    /// serve. The composite gate runs only on an enabled RESULT.
+    #[test]
+    fn set_critical_wp_disable_always_allowed() {
+        let mut config = crate::config::Config::default();
+        config.web_protection.enabled = true;
+        config.web_protection.listen = "not-an-address".into();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[("web_protection.enabled", serde_json::json!(false))]),
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert!(!config.web_protection.enabled);
+    }
+
+    /// Strict types: a present web_protection.* key with the wrong JSON
+    /// type is an error, never a silent no-op.
+    #[test]
+    fn set_critical_wp_wrong_types_rejected() {
+        for (key, val) in [
+            ("web_protection.enabled", serde_json::json!("yes")),
+            ("web_protection.listen", serde_json::json!(53)),
+            ("web_protection.upstreams", serde_json::json!("system")),
+            ("web_protection.block_response", serde_json::json!(0)),
+            ("web_protection.log_queries", serde_json::json!(1)),
+        ] {
+            let mut config = crate::config::Config::default();
+            let before = config_json(&config);
+            let applied = super::apply_set_critical_params(
+                &mut config,
+                &set_critical_params(&[(key, val)]),
+            );
+            assert!(
+                applied.errors.iter().any(|e| e.contains(key)),
+                "{key}: wrong type must be rejected: {:?}",
+                applied.errors
+            );
+            assert_eq!(config_json(&config), before, "{key} must not apply");
+        }
+    }
+
+    /// Per-key validation spot-checks for the remaining web_protection
+    /// fields: upstream entries, block_response allowlist, health-check
+    /// name and allowlist entries.
+    #[test]
+    fn set_critical_wp_field_validation() {
+        // A garbage upstream (not "system", not IP:port).
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.upstreams",
+                serde_json::json!(["9.9.9.9"]),
+            )]),
+        );
+        assert!(applied.errors.iter().any(|e| e.contains("web_protection.upstreams")));
+
+        // block_response outside the allowlist.
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.block_response",
+                serde_json::json!("redirect"),
+            )]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("not in allowlist (nxdomain|zero_ip)"))
+        );
+
+        // health_check_name with a backslash (escape-unaware probe).
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.health_check_name",
+                serde_json::json!("ex\\ample.com"),
+            )]),
+        );
+        assert!(
+            applied
+                .errors
+                .iter()
+                .any(|e| e.contains("web_protection.health_check_name"))
+        );
+
+        // allowlist entry with whitespace.
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[(
+                "web_protection.allowlist",
+                serde_json::json!(["bad name.example"]),
+            )]),
+        );
+        assert!(applied.errors.iter().any(|e| e.contains("web_protection.allowlist")));
+
+        // …and the valid forms of all four sail through.
+        let mut config = crate::config::Config::default();
+        let applied = super::apply_set_critical_params(
+            &mut config,
+            &set_critical_params(&[
+                (
+                    "web_protection.upstreams",
+                    serde_json::json!(["system", "9.9.9.9:53"]),
+                ),
+                ("web_protection.block_response", serde_json::json!("nxdomain")),
+                ("web_protection.health_check_name", serde_json::json!("example.org")),
+                (
+                    "web_protection.blocklists",
+                    serde_json::json!(["C:\\feeds\\md.txt|suffix", "C:\\feeds\\plain.txt"]),
+                ),
+                (
+                    "web_protection.allowlist",
+                    serde_json::json!([".corp.example.com", "host.example.com"]),
+                ),
+                ("web_protection.log_queries", serde_json::json!(true)),
+            ]),
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert_eq!(
+            config.web_protection.upstreams,
+            vec!["system".to_string(), "9.9.9.9:53".to_string()]
+        );
+        assert_eq!(config.web_protection.health_check_name, "example.org");
+        assert!(config.web_protection.log_queries);
+    }
+
+    /// The token/auth envelope keys never trip the unknown-key sweep.
+    #[test]
+    fn set_critical_envelope_keys_are_not_unknown() {
+        let mut config = crate::config::Config::default();
+        let params = serde_json::json!({
+            "token": "challenge",
+            "auth": "ipc-secret",
+            "auto_quarantine": false,
+        });
+        let applied = super::apply_set_critical_params(&mut config, &params);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
     }
 
     // ☠️ R8-LETHAL regression: every path-accepting IPC method (scan.start,
