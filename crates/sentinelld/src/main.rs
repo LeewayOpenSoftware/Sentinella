@@ -333,6 +333,39 @@ async fn run_daemon(
     let config = config::load(args.config.as_deref())?;
     info!(?config.realtime_enabled, "configuration loaded");
 
+    // ── Web protection (DNS-layer filtering) starts FIRST ───────────
+    // It used to start after the ClamAV engine load below, which left a
+    // minutes-long unfiltered window at every boot (the service is
+    // delayed-auto and the engine compile is the slow part). Nothing
+    // web protection touches depends on the engine, the state DB, or the
+    // IPC server: it needs only the config, `paths` (initialized above)
+    // and the DACL-hardened data root (hardened above). So it starts
+    // here, and the handle is PUBLISHED later, once `server` exists.
+    //
+    // Default-OFF; `start` never fails the daemon — a refusal is reported
+    // through the status surface and the log, because a daemon that will
+    // not start because its DNS filter could not is worse than one that
+    // starts with filtering off. A refusal classified transient is retried
+    // in the background (spawn_retry below) instead of disabling the
+    // feature until a manual service restart.
+    //
+    // When this succeeds AND the boot reconciler's task is registered, an
+    // NRPT rule is installed and the machine's DNS goes through the proxy.
+    // Without that task — any development build — it serves but installs
+    // nothing, and you reach it directly: `nslookup name 127.0.0.1`.
+    let web_protection = web_protection::WebProtection::start(&config.web_protection).await;
+    let web_protection = Arc::new(tokio::sync::Mutex::new(web_protection));
+    // Handle-publish channel: retries re-publish through the sender; the
+    // forwarder (spawned once `server` exists) pushes them into AppState.
+    let (wp_handle_tx, mut wp_handle_rx) =
+        tokio::sync::watch::channel(web_protection.lock().await.handle());
+    let wp_retry = web_protection::spawn_retry(
+        Arc::clone(&web_protection),
+        config.web_protection.clone(),
+        wp_handle_tx,
+    )
+    .await;
+
     // Resolve ClamAV paths.
     // Priority: CLI args > auto-detect relative to exe.
     let exe_dir = std::env::current_exe()
@@ -490,20 +523,23 @@ async fn run_daemon(
     // Load FISH config from config file.
     server.state().load_fish_config(config.fish.clone());
 
-    // Web protection (DNS-layer filtering). Default-OFF; `start` never
-    // fails the daemon — a refusal is reported through the status surface
-    // and the log, because a daemon that will not start because its DNS
-    // filter could not is worse than one that starts with filtering off.
-    //
-    // When this succeeds AND the boot reconciler's task is registered, an
-    // NRPT rule is installed and the machine's DNS goes through the proxy.
-    // Without that task — any development build — it serves but installs
-    // nothing, and you reach it directly: `nslookup name 127.0.0.1`.
-    let mut web_protection = web_protection::WebProtection::start(&config.web_protection).await;
-    // Publish the read-only half so `webprotection.status` can answer.
-    // The subsystem itself stays owned here, because stop() needs &mut and
-    // AppState outlives process exit.
-    server.state().set_web_protection(web_protection.handle());
+    // Publish the web-protection handle (the subsystem started BEFORE the
+    // engine load — see above) so `webprotection.status` can answer, and
+    // forward every retry-driven re-publish into AppState. The subsystem
+    // itself stays owned here behind the mutex, because stop() needs to
+    // rendezvous with whatever attempt is current and AppState outlives
+    // process exit.
+    server
+        .state()
+        .set_web_protection(wp_handle_rx.borrow_and_update().clone());
+    {
+        let wp_state = Arc::clone(server.state());
+        tokio::spawn(async move {
+            while wp_handle_rx.changed().await.is_ok() {
+                wp_state.set_web_protection(wp_handle_rx.borrow_and_update().clone());
+            }
+        });
+    }
 
     // Load detection exclusions from config.
     if !config.excluded_detections.is_empty() {
@@ -597,26 +633,40 @@ async fn run_daemon(
         None
     };
 
-    // Handle graceful shutdown on Ctrl+C.
-    let shutdown_state = Arc::clone(server.state());
-    tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            info!("shutdown signal received");
-            shutdown_state.log_activity(
-                "info",
-                "system",
-                "Daemon shutting down",
-                "Graceful shutdown",
-                None,
-            );
-        }
-    });
+    // Handle graceful shutdown on Ctrl+C — there IS no other handler:
+    // `server.run()` has no Ctrl+C logic of its own (an earlier comment
+    // here claimed it did; nothing in ipc/ touches tokio::signal), so a
+    // foreground Ctrl+C used to kill the process without any of the
+    // cleanup below — including NRPT rule removal, leaving the machine's
+    // DNS pointed at a dead listener until the boot reconciler's next run.
+    // The task sets a flag shaped exactly like the SCM's, and the
+    // shutdown_signal arm below observes either one.
+    let ctrl_c_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&ctrl_c_flag);
+        let shutdown_state = Arc::clone(server.state());
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                info!("shutdown signal received");
+                shutdown_state.log_activity(
+                    "info",
+                    "system",
+                    "Daemon shutting down",
+                    "Graceful shutdown",
+                    None,
+                );
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+    // Service mode passes the SCM flag in; foreground gets the Ctrl+C one.
+    let shutdown = shutdown.or(Some(ctrl_c_flag));
 
-    // Audit fix: under the Windows service there is no Ctrl+C — the SCM sets
-    // the `shutdown` flag. Previously the service path cancelled the whole
-    // run_daemon future on stop, so the cleanup below (scheduler.stop, final
-    // log) NEVER ran. Now we race `server.run()` against the shutdown flag so
-    // that on an SCM stop we fall through to graceful cleanup.
+    // Race `server.run()` against the shutdown flag (SCM stop or Ctrl+C —
+    // see above) so that on either stop we fall through to graceful
+    // cleanup instead of cancelling the whole run_daemon future, which is
+    // how the cleanup below (web protection stop, scheduler.stop, final
+    // log) used to be skipped entirely.
     let run_result = {
         let shutdown_signal = async {
             match &shutdown {
@@ -626,15 +676,15 @@ async fn run_daemon(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 },
-                // Foreground/non-service: rely on server.run()'s own Ctrl+C
-                // handling — never trip this branch.
+                // Unreachable today (the flag is always installed above);
+                // kept so a future caller without a flag compiles.
                 None => std::future::pending::<()>().await,
             }
         };
         tokio::select! {
             res = server.run() => res,
             _ = shutdown_signal => {
-                info!("SCM stop requested — beginning graceful shutdown");
+                info!("stop requested — beginning graceful shutdown");
                 Ok(())
             }
         }
@@ -642,14 +692,20 @@ async fn run_daemon(
 
     // Cleanup ALWAYS runs now (both error and stop paths).
     //
-    // Web protection stops FIRST and is JOINED, unlike the flag-store
-    // stop() of the other subsystems. It matters from commit C onward:
-    // the NRPT rule is removed during shutdown, and removing it while the
-    // sockets are still bound would leave a window where the machine's DNS
-    // points at a listener that is going away. Establishing the rendezvous
-    // now means that commit does not have to change this ordering under
-    // pressure. Bounded at 5s against the SCM's 30s total stop budget.
-    web_protection.stop().await;
+    // The retry loop goes FIRST: it must be told to stop (and joined)
+    // before the subsystem is stopped, or it could swap a freshly serving
+    // proxy — rule installed — into the box while we are tearing down.
+    // RetryGuard::shutdown closes that window itself (a successful
+    // in-flight attempt stops cleanly, rule first).
+    if let Some(guard) = wp_retry {
+        guard.shutdown().await;
+    }
+    // Web protection stops next and is JOINED, unlike the flag-store
+    // stop() of the other subsystems: shutdown removes the NRPT rule, and
+    // removing it while the sockets are still bound would leave a window
+    // where the machine's DNS points at a listener that is going away.
+    // Bounded at 5s against the SCM's 30s total stop budget.
+    web_protection.lock().await.stop().await;
 
     if let Some(s) = scheduler {
         s.stop();

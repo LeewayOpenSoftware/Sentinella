@@ -15,7 +15,7 @@ pub enum ProxyState {
     BindFailed,
     /// Bound, but the four-step self-test did not pass. The proxy is NOT
     /// serving: we do not run a listener we could not prove works,
-    /// because a later commit would install a rule on the strength of it.
+    /// because `rule::install` installs an NRPT rule on the strength of it.
     SelfTestFailed,
     /// Bound, self-tested, serving.
     Serving,
@@ -41,14 +41,33 @@ pub struct WebProtectionStatus {
     pub state: ProxyState,
     /// Address actually bound, when serving.
     pub listen: Option<String>,
-    /// Upstreams currently in force (after discovery).
+    /// Upstreams currently in force (after discovery). Read LIVE from the
+    /// proxy's upstream handle while serving: the refresher swaps the list
+    /// on network change, and reporting the start-time copy showed the
+    /// machine resolvers it had already abandoned.
     pub upstreams: Vec<String>,
-    /// Healthy upstreams over total, from the last self-test.
+    /// Healthy upstreams over total. While serving this is live too: the
+    /// watchdog probes each upstream directly and `healthy` is
+    /// `total - degraded`. When not serving it is the last self-test's
+    /// count (which is all there is to know).
     pub upstreams_healthy: usize,
     pub upstreams_total: usize,
+    /// Upstreams the watchdog's direct probes currently cannot reach.
+    /// ADDITIVE (wave-1): older readers ignore it. Round-robin has no
+    /// failover, so every entry here is a share of the machine's queries
+    /// SERVFAILing — surfaced, never auto-removed from the active list.
+    pub upstreams_degraded: Vec<String>,
+    /// The watchdog fired: it judged the proxy unhealthy and removed (or
+    /// tried to remove) the NRPT rule. ADDITIVE (wave-1). `state` stays
+    /// `Serving` — the listener is still up, it is the machine's DNS that
+    /// no longer goes through it — so this fact needs its own field.
+    pub watchdog_fired: bool,
     /// Rules loaded into the filter engine.
     pub rules_loaded: u64,
-    /// Human-readable detail for a failed state; empty when serving.
+    /// Human-readable detail. Empty only when serving with nothing to
+    /// report; set on refusals, on degraded upstreams, and when the
+    /// watchdog fired. Also carries the retry schedule while a refused
+    /// start is being retried.
     pub detail: String,
     /// Counters, when serving.
     pub queries: u64,
@@ -59,10 +78,12 @@ pub struct WebProtectionStatus {
 
 impl WebProtectionStatus {
     /// The status of a daemon where web protection is off. `nrpt_installed`
-    /// is `None` rather than `Some(false)`: with no NRPT code in this
-    /// commit we genuinely do not know, and claiming otherwise would be
-    /// the kind of confident-but-false statement this project keeps
-    /// getting bitten by.
+    /// is `None` rather than `Some(false)`: with no rule GUID in hand there
+    /// is nothing to query the registry FOR, and claiming "not installed"
+    /// would be the kind of confident-but-false statement this project
+    /// keeps getting bitten by. (A rule orphaned by a previous run is not
+    /// this function's business — `service::reconcile_orphan_rule` handles
+    /// it on every non-serving path.)
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -72,6 +93,8 @@ impl WebProtectionStatus {
             upstreams: Vec::new(),
             upstreams_healthy: 0,
             upstreams_total: 0,
+            upstreams_degraded: Vec::new(),
+            watchdog_fired: false,
             rules_loaded: 0,
             detail: String::new(),
             queries: 0,
@@ -108,6 +131,8 @@ mod tests {
             "upstreams",
             "upstreams_healthy",
             "upstreams_total",
+            "upstreams_degraded",
+            "watchdog_fired",
             "rules_loaded",
             "detail",
             "queries",
@@ -117,6 +142,11 @@ mod tests {
         ] {
             assert!(v.get(k).is_some(), "status is missing field {k}");
         }
+        // The additive wave-1 fields must be additive in SHAPE too: a
+        // reader that predates them ignores them, a reader that expects
+        // them gets these types.
+        assert_eq!(v["watchdog_fired"], serde_json::json!(false));
+        assert_eq!(v["upstreams_degraded"], serde_json::json!([]));
     }
 
     #[test]

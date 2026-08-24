@@ -52,6 +52,6 @@ pub mod status;
 pub mod upstreams;
 
 pub use config::WebProtectionConfig;
-pub use service::{WebProtection, WebProtectionHandle};
-#[allow(unused_imports)] // consumed by the IPC status surface later in this commit
+pub use service::{WebProtection, WebProtectionHandle, spawn_retry};
+#[allow(unused_imports)] // re-exported for ipc::state::web_protection_status
 pub use status::WebProtectionStatus;

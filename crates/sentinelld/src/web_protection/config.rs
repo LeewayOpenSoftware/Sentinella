@@ -14,7 +14,7 @@
 //! clamp-and-warn convention. Resetting a malformed `listen` to a
 //! plausible default (the pattern used by `update_mirror`,
 //! `clamav_isolation`, `sandbox.mode` and friends) would leave the section
-//! looking configured and let a later commit install an NRPT rule on the
+//! looking configured and let `rule::install` put an NRPT rule in on the
 //! strength of it. Invalid input FORCES `enabled = false`, following the
 //! one existing precedent that does the same — developer mode without a
 //! provisioned password.
@@ -162,7 +162,13 @@ impl WebProtectionConfig {
 
     /// The conditions under which `enabled = true` can be honoured.
     /// Split out so it is testable without going through `warn!`.
-    fn check_enablable(&self) -> Result<(), String> {
+    ///
+    /// `pub(crate)` because `protection.set_critical` runs this as a
+    /// composite gate on the merged section: an IPC write whose RESULT is
+    /// `enabled = true` with an unservable config is rejected with this
+    /// reason instead of being saved and then silently force-disabled by
+    /// [`Self::validate`].
+    pub(crate) fn check_enablable(&self) -> Result<(), String> {
         let addr: SocketAddr = self
             .listen
             .parse()
@@ -269,7 +275,7 @@ mod tests {
     /// The whole point of this module: malformed input must DISABLE, not
     /// be substituted into something that looks configured. The crate's
     /// usual convention would turn each of these into a working-looking
-    /// proxy that a later commit would install an NRPT rule for.
+    /// proxy that `rule::install` would put an NRPT rule in for.
     #[test]
     fn malformed_input_disables_rather_than_substituting() {
         type Mutate = fn(&mut WebProtectionConfig);

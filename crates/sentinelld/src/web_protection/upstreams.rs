@@ -67,7 +67,9 @@ pub enum DiscoveryError {
     QueryFailed(String),
     /// No up, non-loopback adapter reported any DNS server.
     NoneConfigured,
-    /// Every discovered server was dropped by the self-reference filter.
+    /// Every discovered server was dropped by the safety filters
+    /// (loopback self-reference, link-local fossil — the variant name
+    /// predates the link-local drop and covers the common case).
     OnlyLoopback { dropped: usize },
 }
 
@@ -78,8 +80,9 @@ impl std::fmt::Display for DiscoveryError {
             Self::NoneConfigured => write!(f, "no active adapter reports a DNS server"),
             Self::OnlyLoopback { dropped } => write!(
                 f,
-                "all {dropped} configured DNS server(s) are loopback addresses — \
-                 forwarding to them would point this proxy at itself; \
+                "all {dropped} configured DNS server(s) are unusable as upstreams \
+                 (loopback — forwarding to them would point this proxy at itself — \
+                 or link-local fossils); \
                  set web_protection.upstreams explicitly"
             ),
         }
@@ -162,6 +165,18 @@ fn filter_usable(raw: Vec<IpAddr>, listen: SocketAddr) -> Vec<SocketAddr> {
             debug!(%ip, "dropping unusable DNS server address");
             continue;
         }
+        // LINK-LOCAL is dropped: 169.254/16 appears when DHCP failed, and
+        // fe80::/10 is interface-scoped — on a roaming laptop both are
+        // stale-network fossils that answer nothing while costing every
+        // query routed to them a full upstream timeout. ULA (fc00::/7) is
+        // KEPT, deliberately: unlike link-local it is routable site-local
+        // space, so a resolver at a ULA address is a deliberate deployment
+        // (corporate internal DNS, IPv6-only home networks), and dropping
+        // it would leave those networks with no filtering at all.
+        if is_link_local(&ip) {
+            debug!(%ip, "dropping link-local DNS server (stale-network fossil)");
+            continue;
+        }
         let addr = SocketAddr::new(ip, DNS_PORT);
         // THE LOOP GUARD. A loopback DNS server on our own port is us, and
         // even a loopback server on a DIFFERENT port is a local resolver
@@ -208,6 +223,16 @@ fn is_ipv6_placeholder(ip: &IpAddr) -> bool {
             seg[0..4] == IPV6_PLACEHOLDER_PREFIX
         }
         IpAddr::V4(_) => false,
+    }
+}
+
+/// IPv4 169.254.0.0/16 and IPv6 fe80::/10 — interface-scoped addresses
+/// that outlive the network they belonged to. See the drop site in
+/// `filter_usable` for why these go and ULA stays.
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
     }
 }
 
@@ -756,6 +781,42 @@ mod tests {
         ];
         let kept = filter_usable(raw, listen53());
         assert_eq!(kept, vec!["9.9.9.9:53".parse::<SocketAddr>().unwrap()]);
+    }
+
+    /// Link-local resolvers are stale-network fossils (169.254/16 = DHCP
+    /// failure, fe80::/10 = interface-scoped) and must be dropped entry by
+    /// entry — never taking the usable resolver next to them down.
+    #[test]
+    fn link_local_resolvers_are_dropped() {
+        let raw = vec![
+            "169.254.1.1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "fe80::a0ff:fe01:2345".parse().unwrap(),
+            "192.168.1.1".parse().unwrap(),
+        ];
+        let kept = filter_usable(raw, listen53());
+        assert_eq!(
+            kept,
+            vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
+            "link-local entries must not become upstreams"
+        );
+    }
+
+    /// ULA (fc00::/7) is KEPT: routable site-local space where an internal
+    /// resolver is a deliberate deployment, unlike link-local. Dropping it
+    /// would un-filter ULA-only networks.
+    #[test]
+    fn ula_resolvers_are_kept() {
+        let raw = vec!["fd00::1".parse().unwrap(), "fc12:3456::53".parse().unwrap()];
+        let kept = filter_usable(raw, listen53());
+        assert_eq!(
+            kept,
+            vec![
+                "[fd00::1]:53".parse::<SocketAddr>().unwrap(),
+                "[fc12:3456::53]:53".parse::<SocketAddr>().unwrap()
+            ],
+            "ULA is site-local but routable — a legitimate internal resolver"
+        );
     }
 
     /// Round-robin gives each entry an equal share, so a duplicate would

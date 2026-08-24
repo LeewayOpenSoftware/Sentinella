@@ -38,7 +38,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dnsguard::filter::{CANARY_DOMAIN, Decision, FilterEngine};
-use dnsguard::proxy::{Counters, is_canary_signature};
+use dnsguard::proxy::{Counters, UpstreamsHandle, is_canary_signature};
 use dnsguard::wire;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -72,11 +72,94 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The resolution probe emits a REAL upstream query, so it runs on every
 /// Nth tick rather than every one: at 20s intervals that is one extra
 /// outbound query per minute, which is noise next to ordinary browsing.
+/// The per-upstream direct probes share this cadence (and add one query
+/// per upstream per round).
 const RESOLVE_EVERY: u64 = 3;
 
 /// More patience than the canary probe: this one waits on an upstream
 /// across the real network, not on a loopback short-circuit.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Re-prove the boot reconciler's scheduled task every Nth tick: at 20s
+/// intervals this is a 5-minute cadence. The task is checked once at
+/// install, but Task Scheduler is user- and malware-writable all session
+/// long, and a mid-session delete otherwise leaves a live rule whose
+/// only remover is this process — unnoticed until the crash it was
+/// registered for.
+const RECONCILER_CHECK_EVERY: u64 = 15;
+
+/// Live health facts maintained by the watchdog, read by the status
+/// surface. Written ONLY here, so status never invents its own idea of
+/// health, and never cleared once `fired` is set — the task exits right
+/// after firing, and a fired watchdog is a fact about the session.
+#[derive(Debug, Default)]
+pub struct WatchdogState {
+    /// Upstreams that failed the most recent direct probe round. Empty
+    /// means "everything answered (or no round has run yet)" — not a
+    /// promise about the next query.
+    pub degraded_upstreams: Vec<SocketAddr>,
+    /// The watchdog judged the proxy unhealthy and tore the rule down
+    /// (or tried to). Terminal for this session.
+    pub fired: bool,
+    /// Why it fired, phrased for the status detail.
+    pub fired_reason: String,
+}
+
+/// The three independent strike counters, kept together so the accounting
+/// is testable without spawning anything.
+///
+/// INDEPENDENT is the whole point (they used to share one counter): the
+/// serving probe runs every tick but the resolution probe only every
+/// RESOLVE_EVERY-th, and the skipped ticks reported `resolving = true` —
+/// so with a proxy that answers the canary while resolving nothing, the
+/// sequence was strike, reset, reset, strike, reset, reset. `strikes`
+/// could never exceed 1 against a threshold of WATCHDOG_STRIKES (3), and
+/// the exact failure the resolution probe was added to catch could never
+/// remove the rule. A skipped resolution tick is NOT evidence of health,
+/// so it must leave the counter untouched rather than clear it.
+#[derive(Debug, Default)]
+struct Strikes {
+    /// Canary probe failed (modulo the busy-is-not-dead rescue).
+    serve: u32,
+    /// The listener could not resolve the health-check name.
+    resolve: u32,
+    /// The boot reconciler's scheduled task is gone mid-session.
+    reconciler: u32,
+}
+
+impl Strikes {
+    fn record_serving(&mut self, serving: bool) {
+        if serving {
+            self.serve = 0;
+        } else {
+            self.serve += 1;
+        }
+    }
+
+    /// `None` means the probe did not run this tick — NOT that it passed.
+    fn record_resolve(&mut self, resolving: Option<bool>) {
+        match resolving {
+            Some(true) => self.resolve = 0,
+            Some(false) => self.resolve += 1,
+            None => {}
+        }
+    }
+
+    /// `None` means the re-check did not run this tick. A task that came
+    /// BACK clears the strikes: the backstop exists again, which is all
+    /// this counter asks.
+    fn record_reconciler(&mut self, present: Option<bool>) {
+        match present {
+            Some(true) => self.reconciler = 0,
+            Some(false) => self.reconciler += 1,
+            None => {}
+        }
+    }
+
+    fn worst(&self) -> u32 {
+        self.serve.max(self.resolve).max(self.reconciler)
+    }
+}
 
 /// Install the rule, honouring both preconditions and the record-first
 /// ordering. Returns the GUID actually in force.
@@ -166,7 +249,7 @@ pub fn installed_now(guid: Option<&str>) -> Option<bool> {
 
 /// Watch the listener and tear the rule down if it stops working.
 ///
-/// # It asks TWO different questions, because the canary answers only one
+/// # It asks THREE different questions, because no two of them answer the third
 ///
 /// The canary is short-circuited inside `handle_query` BEFORE
 /// decide/cache/forward. That is what makes its signature unforgeable — and
@@ -180,17 +263,45 @@ pub fn installed_now(guid: Option<&str>) -> Option<bool> {
 /// periodic RESOLUTION probe proves "and it can actually resolve". Neither
 /// alone is enough, and the first alone is what an earlier version of this
 /// file certified as healthy.
+///
+/// The third question is asked of the SCHEDULER, not the proxy: is the boot
+/// reconciler's task still registered? It is the only thing that removes
+/// the rule when this process cannot, and a mid-session deletion (user
+/// cleanup, "optimizer" tools, malware) used to leave a live rule with no
+/// backstop, unnoticed. Every RECONCILER_CHECK_EVERY ticks the watchdog
+/// re-proves it; gone counts as a strike — removing the rule when the
+/// backstop is gone is the fail-safe direction, because a rule nothing
+/// else can remove may only exist while this process is provably healthy.
+///
+/// # Per-upstream health is surfaced, never mutated
+///
+/// The resolution probe goes through the listener, and the listener
+/// round-robins without failover — so with one of two upstreams dead the
+/// probe fails only its unlucky half of ticks and `resolve_strikes` keeps
+/// resetting: ~50% of the machine's queries SERVFAIL forever, undetected.
+/// So every RESOLVE_EVERY ticks each upstream is ALSO probed DIRECTLY
+/// (the same query shape the self-test's step (ii) uses; `forward_via` is
+/// private to dnsguard, so the probe here is a local equivalent built on
+/// the public `wire` helpers). Failures are written to `WatchdogState`
+/// for the status surface. The upstream list itself is NOT touched:
+/// dropping a dead-but-coming-back resolver is a policy decision, and the
+/// refresher already owns list mutation. Rule-removal strikes still come
+/// only from the through-listener probe, unchanged: persistent listener
+/// failure (which is what ALL upstreams dead looks like) removes the
+/// rule, partial failure does not.
+#[allow(clippy::too_many_arguments)] // one subsystem's worth of shared state; a bundle struct would just rename the list
 pub fn spawn_watchdog(
     guid: String,
     listen: SocketAddr,
     counters: Arc<Counters>,
     engine: Arc<RwLock<FilterEngine>>,
+    upstreams: UpstreamsHandle,
     health_check_name: String,
+    state: Arc<RwLock<WatchdogState>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut serve_strikes = 0u32;
-        let mut resolve_strikes = 0u32;
+        let mut strikes = Strikes::default();
         let mut tick = 0u64;
         loop {
             tokio::select! {
@@ -234,8 +345,9 @@ pub fn spawn_watchdog(
             }
 
             let ran_resolve_probe = tick.is_multiple_of(RESOLVE_EVERY);
-            let resolving = if ran_resolve_probe {
-                if health_name_is_allowed(&engine, &health_check_name) {
+            let mut resolving = None;
+            if ran_resolve_probe {
+                resolving = Some(if health_name_is_allowed(&engine, &health_check_name) {
                     probe_resolves(listen, &health_check_name).await
                 } else {
                     // A `zero_ip` block answer is NOERROR with one A record,
@@ -249,65 +361,116 @@ pub fn spawn_watchdog(
                          watchdog cannot verify resolution — pick a name you never block"
                     );
                     true
+                });
+
+                // EVERY upstream, probed DIRECTLY (bypassing the listener,
+                // so the filter's decision on the health name is irrelevant
+                // here): round-robin without failover means one dead
+                // upstream breaks its share of the machine's queries while
+                // the through-listener probe above keeps passing on the
+                // healthy half. Sequential with RESOLVE_TIMEOUT each —
+                // bounded by (upstream count × 3s), and upstream lists are
+                // short (one per adapter, usually two total).
+                let current = upstreams.get();
+                let mut degraded: Vec<SocketAddr> = Vec::new();
+                for up in &current {
+                    if !probe_resolves(*up, &health_check_name).await {
+                        degraded.push(*up);
+                    }
                 }
+                {
+                    let mut ws = state.write().unwrap_or_else(|p| p.into_inner());
+                    if ws.degraded_upstreams != degraded {
+                        if degraded.is_empty() {
+                            info!("web protection: all upstreams answering again");
+                        } else {
+                            warn!(
+                                degraded = ?degraded,
+                                total = current.len(),
+                                "web protection: upstream(s) not answering direct probes — \
+                                 their round-robin share of queries is SERVFAILing (surfaced \
+                                 in status; the active list is NOT mutated)"
+                            );
+                        }
+                        ws.degraded_upstreams = degraded;
+                    }
+                }
+            }
+
+            // Re-prove the remover. Checked once at install, but the task
+            // can be deleted at any moment after; without this the rule
+            // would outlive the only out-of-process mechanism able to
+            // remove it, and nobody would know.
+            let reconciler_present = if tick.is_multiple_of(RECONCILER_CHECK_EVERY) {
+                let present = nrpt::reconciler_task_installed();
+                if !present {
+                    error!(
+                        "web protection: the boot reconciler's scheduled task is GONE \
+                         mid-session — nothing out-of-process could remove the NRPT rule \
+                         after a crash; counting this toward rule removal"
+                    );
+                }
+                Some(present)
             } else {
-                true
+                None
             };
 
-            // Two INDEPENDENT strike counters, and this is the whole point.
-            //
-            // They used to share one counter, which made the resolution half
-            // of this watchdog decorative. The serving probe runs every tick
-            // but the resolution probe only every RESOLVE_EVERY-th, and the
-            // skipped ticks reported `resolving = true` — so with a proxy
-            // that answers the canary while resolving nothing, the sequence
-            // was strike, reset, reset, strike, reset, reset. `strikes` could
-            // never exceed 1 against a threshold of WATCHDOG_STRIKES (3), so
-            // the exact failure this probe was added to catch could never
-            // remove the rule. The machine kept every name pointed at a proxy
-            // that answered nothing, indefinitely.
-            //
-            // A skipped resolution tick is NOT evidence of health, so it must
-            // leave `resolve_strikes` untouched rather than clear it.
-            if serving {
-                serve_strikes = 0;
-            } else {
-                serve_strikes += 1;
-            }
-            if ran_resolve_probe {
-                if resolving {
-                    resolve_strikes = 0;
-                } else {
-                    resolve_strikes += 1;
-                }
-            }
-            let strikes = serve_strikes.max(resolve_strikes);
-            if serving && resolving {
+            strikes.record_serving(serving);
+            strikes.record_resolve(resolving);
+            strikes.record_reconciler(reconciler_present);
+            let worst = strikes.worst();
+            if worst == 0 {
                 continue;
             }
             warn!(
-                strikes,
+                strikes = worst,
+                serve_strikes = strikes.serve,
+                resolve_strikes = strikes.resolve,
+                reconciler_strikes = strikes.reconciler,
                 answered,
                 counter_moved = moved,
-                resolving,
+                resolving = ?resolving,
                 "web protection: watchdog check failed"
             );
-            if strikes < WATCHDOG_STRIKES {
+            if worst < WATCHDOG_STRIKES {
                 continue;
             }
 
+            let cause = if strikes.reconciler >= WATCHDOG_STRIKES {
+                "the boot reconciler task is gone"
+            } else if strikes.serve >= WATCHDOG_STRIKES {
+                "the proxy stopped answering"
+            } else {
+                "the proxy resolves nothing"
+            };
             error!(
                 %guid,
-                "web protection: proxy unhealthy for {}s — removing the NRPT rule so the machine \
+                cause,
+                "web protection: unhealthy for {}s — removing the NRPT rule so the machine \
                  keeps working DNS",
                 WATCHDOG_INTERVAL.as_secs() * WATCHDOG_STRIKES as u64
             );
-            if let Err(e) = remove(&guid) {
-                // The rule is still live and we could not remove it. The
-                // boot reconciler is the backstop; say so rather than
-                // pretending this was handled.
-                error!(%e, "web protection: COULD NOT remove the rule — the boot reconciler will \
-                            remove it at next startup");
+            let fired_reason = match remove(&guid) {
+                Ok(()) => format!(
+                    "watchdog fired ({cause}): the NRPT rule was removed and DNS is back on \
+                     system defaults — filtering is OFF"
+                ),
+                Err(e) => {
+                    // The rule is still live and we could not remove it.
+                    // The boot reconciler is the backstop; say so rather
+                    // than pretending this was handled.
+                    error!(%e, "web protection: COULD NOT remove the rule — the boot reconciler will \
+                                remove it at next startup");
+                    format!(
+                        "watchdog fired ({cause}) but the NRPT rule could NOT be removed: {e} — \
+                         the boot reconciler is the backstop at next startup"
+                    )
+                }
+            };
+            {
+                let mut ws = state.write().unwrap_or_else(|p| p.into_inner());
+                ws.fired = true;
+                ws.fired_reason = fired_reason;
             }
             return;
         }
@@ -349,7 +512,13 @@ async fn probe_canary(addr: SocketAddr) -> bool {
     }
 }
 
-/// Ask the listener to actually RESOLVE a name, and require a real answer.
+/// Ask a DNS server to actually RESOLVE a name, and require a real answer.
+///
+/// Used two ways: against the LISTENER (the watchdog's resolution probe —
+/// proves the serving path end to end) and against each UPSTREAM directly
+/// (the per-upstream health round — proves reachability, bypassing the
+/// listener and therefore the filter, so the engine's decision on the
+/// health-check name is irrelevant for the second use).
 async fn probe_resolves(addr: SocketAddr, name: &str) -> bool {
     let Ok(sock) = UdpSocket::bind("127.0.0.1:0").await else {
         return false;
@@ -383,14 +552,17 @@ async fn probe_resolves(addr: SocketAddr, name: &str) -> bool {
 fn rand_id() -> u16 {
     // Loopback, connected socket: this only needs to differ between probes
     // so a late reply to a previous one cannot satisfy the current check.
+    // Two ingredients, each carrying its half of that: a process-global
+    // counter guarantees probe-to-probe difference, and a fresh RandomState
+    // (randomly seeded per construction) makes the id unguessable to
+    // whatever else owns a socket. An earlier version hashed
+    // `SystemTime::now().elapsed()` — ~0 by construction — so the counter
+    // half was silently absent.
     use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u64(
-        std::time::SystemTime::now()
-            .elapsed()
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0),
-    );
+    h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
     (h.finish() >> 16) as u16
 }
 
@@ -516,5 +688,84 @@ mod tests {
         let total = WATCHDOG_INTERVAL * WATCHDOG_STRIKES;
         assert!(total >= Duration::from_secs(45), "too twitchy: {total:?}");
         assert!(total <= Duration::from_secs(120), "too slow: {total:?}");
+    }
+
+    /// The reconciler re-check cadence: minutes, not seconds (Task
+    /// Scheduler reads are not free) and not hours (a deleted backstop is
+    /// a live rule with no out-of-process remover).
+    #[test]
+    fn reconciler_recheck_cadence_is_a_few_minutes() {
+        let total = WATCHDOG_INTERVAL * RECONCILER_CHECK_EVERY as u32;
+        assert!(total >= Duration::from_secs(60), "too twitchy: {total:?}");
+        assert!(total <= Duration::from_secs(15 * 60), "too slow: {total:?}");
+    }
+
+    /// REGRESSION PIN for the shared-counter bug: a skipped resolution
+    /// tick must leave the resolve counter UNTOUCHED, or a proxy that
+    /// answers the canary while resolving nothing accumulates strike,
+    /// reset, reset forever and can never reach the threshold.
+    #[test]
+    fn a_skipped_resolve_tick_is_not_evidence_of_health() {
+        let mut s = Strikes::default();
+        s.record_resolve(Some(false));
+        s.record_resolve(None);
+        s.record_resolve(None);
+        assert_eq!(s.resolve, 1, "skipped ticks must not clear the strike");
+        s.record_resolve(Some(false));
+        s.record_resolve(Some(false));
+        assert!(s.worst() >= WATCHDOG_STRIKES, "persistent failure must trip");
+        s.record_resolve(Some(true));
+        assert_eq!(s.worst(), 0, "a real success resets");
+    }
+
+    /// The reconciler counter: a gone task strikes toward removal (fail-
+    /// safe), a task that comes back clears it, and a tick that did not
+    /// re-check changes nothing.
+    #[test]
+    fn a_gone_reconciler_counts_toward_rule_removal() {
+        let mut s = Strikes::default();
+        s.record_reconciler(None);
+        assert_eq!(s.worst(), 0, "no re-check this tick, no opinion");
+        for _ in 0..WATCHDOG_STRIKES {
+            s.record_reconciler(Some(false));
+        }
+        assert!(s.worst() >= WATCHDOG_STRIKES);
+        s.record_reconciler(Some(true));
+        assert_eq!(s.worst(), 0, "the backstop is back — strikes clear");
+    }
+
+    /// Serving and reconciler failures are independent counters: the
+    /// busy-is-not-dead rescue cannot mask a missing reconciler, and a
+    /// healthy proxy does not excuse it either.
+    #[test]
+    fn strike_counters_are_independent() {
+        let mut s = Strikes::default();
+        s.record_serving(false);
+        s.record_reconciler(Some(false));
+        s.record_serving(true); // rescued/recovered serving...
+        assert_eq!(s.serve, 0);
+        assert_eq!(s.reconciler, 1, "...must not clear the reconciler strike");
+    }
+
+    /// A direct probe must ACCEPT a real resolution — the rejection shapes
+    /// are covered above, but a probe that rejects everything would mark
+    /// every upstream degraded on a healthy machine.
+    #[tokio::test]
+    async fn resolution_probe_accepts_a_real_answer() {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, peer)) = server.recv_from(&mut buf) {
+                let mut resp = buf[..n].to_vec();
+                if resp.len() >= 8 {
+                    resp[2] = 0x81;
+                    resp[3] = 0; // NOERROR
+                    resp[6..8].copy_from_slice(&1u16.to_be_bytes()); // ancount 1
+                }
+                let _ = server.send_to(&resp, peer);
+            }
+        });
+        assert!(probe_resolves(addr, "example.com").await);
     }
 }

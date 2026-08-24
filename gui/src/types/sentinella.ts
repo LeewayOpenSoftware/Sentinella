@@ -112,13 +112,36 @@ export interface WebProtectionStatus {
   state: ProxyState;
   /** Address actually bound, when serving. */
   listen: string | null;
+  /** Live while serving (follows network-change refreshes). */
   upstreams: string[];
-  /** Healthy upstreams over total, from the last self-test. */
+  /**
+   * Healthy over total. Live while serving: the watchdog probes each
+   * upstream directly and healthy = total - degraded.
+   */
   upstreams_healthy: number;
   upstreams_total: number;
+  /**
+   * ADDITIVE (daemon wave-1): upstreams the watchdog's direct probes
+   * cannot reach right now. Round-robin has no failover, so each entry
+   * is a share of the machine's queries SERVFAILing. Absent from older
+   * daemons — treat undefined as [].
+   */
+  upstreams_degraded?: string[];
+  /**
+   * ADDITIVE (daemon wave-1): the watchdog judged the proxy unhealthy and
+   * removed the NRPT rule. Deliberately NOT a new ProxyState — `state`
+   * stays "serving" (the listener is up; it is the machine's DNS that no
+   * longer goes through it), so existing state-keyed rendering is
+   * unaffected. Absent from older daemons — treat undefined as false.
+   */
+  watchdog_fired?: boolean;
   /** Rules loaded into the filter engine. */
   rules_loaded: number;
-  /** Human-readable detail for a failed state; empty when serving. */
+  /**
+   * Human-readable detail. Empty only when serving with nothing to
+   * report; also set for degraded upstreams, a fired watchdog, and the
+   * retry schedule while a refused start is being retried.
+   */
   detail: string;
   queries: number;
   blocked: number;
