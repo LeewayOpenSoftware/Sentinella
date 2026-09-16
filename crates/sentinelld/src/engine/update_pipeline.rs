@@ -77,6 +77,44 @@ pub struct ManifestFile {
     pub size: u64,
 }
 
+/// Persisted per-provider anti-rollback ledger (SR-08). Maps a provider id
+/// to the last manifest it was accepted at, so a later, older manifest can
+/// be refused as a downgrade.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ProviderVersionLedger {
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, ProviderVersionRecord>,
+}
+
+/// One provider's last-accepted manifest point.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProviderVersionRecord {
+    /// Provider-declared version string (audit/diagnostic only).
+    version: String,
+    /// Provider-declared `updated_at`, kept verbatim for diagnostics.
+    updated_at: String,
+    /// `updated_at` parsed to epoch seconds — the value actually compared.
+    accepted_epoch: i64,
+}
+
+/// Parse a manifest `updated_at` into epoch seconds. Accepts RFC-3339
+/// (`2026-05-25T12:00:00Z`), a bare date-time (`2026-05-25T12:00:00`) and a
+/// bare ISO date (`2026-05-25`, interpreted as UTC midnight). Anything else
+/// returns `None`, and the caller treats that as a fail-closed rejection.
+fn parse_manifest_instant(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.timestamp());
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S") {
+        return Some(ndt.and_utc().timestamp());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc().timestamp());
+    }
+    None
+}
+
 /// Staging metadata — written alongside downloaded files.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StagingMeta {
@@ -638,9 +676,99 @@ impl SignatureUpdateManager {
             }
         }
 
+        // SR-08: monotonic anti-rollback. Refuse a manifest that is older
+        // than the last one this provider was accepted at, and record the
+        // accepted point. This runs only after the manifest has passed
+        // provider-id, hash and coverage checks, so we never persist a
+        // version for a manifest we would not otherwise activate.
+        self.enforce_anti_rollback(provider_id, &manifest)?;
+
         // Clean up the manifest file (not a signature file).
         let _ = std::fs::remove_file(&manifest_path);
         Ok(())
+    }
+
+    /// Path of the per-provider version ledger used for anti-rollback.
+    /// Anchored next to the active enhanced-signature directory (never
+    /// CWD-relative — see the R9-LETHAL note in `download_files`).
+    fn version_ledger_path(&self) -> PathBuf {
+        self.active_enhanced_dir
+            .with_file_name("enhanced_versions.json")
+    }
+
+    /// Load the persisted version ledger. A missing or unparseable ledger
+    /// reads as empty: a corrupt ledger must not wedge updates, and an
+    /// empty ledger only means "no baseline yet", never "accept anything
+    /// older" — the caller records a fresh baseline on the next success.
+    fn load_version_ledger(&self) -> ProviderVersionLedger {
+        std::fs::read_to_string(self.version_ledger_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the version ledger via a temp-file + rename so a crash
+    /// mid-write cannot leave a truncated ledger behind.
+    fn save_version_ledger(&self, ledger: &ProviderVersionLedger) -> Result<(), String> {
+        let path = self.version_ledger_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create ledger dir: {e}"))?;
+        }
+        let json =
+            serde_json::to_string_pretty(ledger).map_err(|e| format!("serialize ledger: {e}"))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| format!("write ledger: {e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("commit ledger: {e}"))?;
+        Ok(())
+    }
+
+    /// SR-08 anti-rollback: reject a provider manifest whose `updated_at`
+    /// is strictly older than the last one accepted for this provider, and
+    /// record the accepted point on success.
+    ///
+    /// The manifest is unsigned, so this closes the *replay* half of SR-08
+    /// (a stale mirror, a cache, or an on-path actor who cannot forge fresh
+    /// metadata — replaying a genuine older manifest is refused). It does
+    /// NOT defend against a provider that is itself compromised and can
+    /// forge `updated_at` forward; closing that requires an independently
+    /// signed manifest, which is a manifest-format decision left open (see
+    /// docs/SIGNED_UPDATE_RECOVERY.md and SR-08).
+    ///
+    /// Fails closed: an incoming `updated_at` that is not a parseable
+    /// ISO-8601 date/date-time is refused rather than accepted blindly.
+    /// An equal timestamp is allowed so a retry after a transient
+    /// activation failure can re-activate the identical, hash-pinned set.
+    fn enforce_anti_rollback(
+        &self,
+        provider_id: &str,
+        manifest: &ProviderManifest,
+    ) -> Result<(), String> {
+        let incoming = parse_manifest_instant(&manifest.updated_at).ok_or_else(|| {
+            format!(
+                "manifest updated_at '{}' is not a parseable ISO-8601 date/date-time — refusing (fail closed)",
+                manifest.updated_at
+            )
+        })?;
+
+        let mut ledger = self.load_version_ledger();
+        if let Some(prev) = ledger.entries.get(provider_id) {
+            if incoming < prev.accepted_epoch {
+                return Err(format!(
+                    "anti-rollback: manifest updated_at '{}' is older than the last accepted '{}' for provider '{}' — refusing downgrade",
+                    manifest.updated_at, prev.updated_at, provider_id
+                ));
+            }
+        }
+
+        ledger.entries.insert(
+            provider_id.to_string(),
+            ProviderVersionRecord {
+                version: manifest.version.clone(),
+                updated_at: manifest.updated_at.clone(),
+                accepted_epoch: incoming,
+            },
+        );
+        self.save_version_ledger(&ledger)
     }
 
     fn cleanup_staging(&self, staging_dir: &Path) {
@@ -903,6 +1031,99 @@ mod tests {
             sha256: None,
         }];
         assert!(mgr.verify_staged(&staging, &files, "test").is_err());
+    }
+
+    // ── SR-08 anti-rollback ─────────────────────────────────────────
+    // These exercise the monotonic downgrade check directly. Together with
+    // `verify_rejects_bad_hash`/`_oversize`/`_empty` (a tampered/invalid
+    // set is refused) and `manifest_parse` (a well-formed set is accepted),
+    // they cover accept / reject-tampered / reject-downgrade for the daemon
+    // provider pipeline.
+
+    fn mk_manifest(provider: &str, version: &str, updated_at: &str) -> ProviderManifest {
+        ProviderManifest {
+            provider_id: provider.into(),
+            version: version.into(),
+            files: vec![],
+            license: "MIT".into(),
+            attribution: "Test".into(),
+            updated_at: updated_at.into(),
+        }
+    }
+
+    fn mk_mgr(dir: &std::path::Path) -> SignatureUpdateManager {
+        SignatureUpdateManager {
+            staging_root: dir.join("staging"),
+            active_enhanced_dir: dir.join("active"),
+            stage: UpdateStage::Idle,
+        }
+    }
+
+    #[test]
+    fn anti_rollback_accepts_first_and_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_mgr(dir.path());
+        // First manifest ever: no baseline, must be accepted and recorded.
+        assert!(
+            mgr.enforce_anti_rollback("prov", &mk_manifest("prov", "1.0", "2026-05-25"))
+                .is_ok()
+        );
+        // A strictly newer manifest is accepted.
+        assert!(
+            mgr.enforce_anti_rollback("prov", &mk_manifest("prov", "1.1", "2026-06-01T09:00:00Z"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn anti_rollback_rejects_older_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_mgr(dir.path());
+        assert!(
+            mgr.enforce_anti_rollback("prov", &mk_manifest("prov", "2.0", "2026-06-01"))
+                .is_ok()
+        );
+        // A genuine older manifest replayed at the same provider: refused.
+        let err = mgr
+            .enforce_anti_rollback("prov", &mk_manifest("prov", "1.0", "2026-05-01"))
+            .unwrap_err();
+        assert!(err.contains("anti-rollback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anti_rollback_allows_equal_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_mgr(dir.path());
+        let m = mk_manifest("prov", "3.0", "2026-06-10T00:00:00Z");
+        assert!(mgr.enforce_anti_rollback("prov", &m).is_ok());
+        // Re-fetching the identical manifest (e.g. retry after a transient
+        // activation failure) is allowed — the files are still hash-pinned.
+        assert!(mgr.enforce_anti_rollback("prov", &m).is_ok());
+    }
+
+    #[test]
+    fn anti_rollback_fails_closed_on_unparseable_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_mgr(dir.path());
+        let err = mgr
+            .enforce_anti_rollback("prov", &mk_manifest("prov", "1.0", "not-a-date"))
+            .unwrap_err();
+        assert!(err.contains("fail closed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anti_rollback_is_per_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_mgr(dir.path());
+        // A high baseline on one provider must not block a different one.
+        assert!(
+            mgr.enforce_anti_rollback("a", &mk_manifest("a", "9.0", "2026-12-31"))
+                .is_ok()
+        );
+        assert!(
+            mgr.enforce_anti_rollback("b", &mk_manifest("b", "1.0", "2026-01-01"))
+                .is_ok()
+        );
     }
 
     #[test]
