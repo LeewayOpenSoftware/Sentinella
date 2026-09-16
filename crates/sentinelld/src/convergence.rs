@@ -201,7 +201,7 @@ impl ConvergenceLedger {
         // by original_weight, keep them at full weight until the cap is
         // hit, then truncate / zero the remainder. Preserves the strongest
         // evidence intact; weakest noise is what gets dropped.
-        if raw_post > POST_ARGUS_CAP && raw_post > 0 {
+        if raw_post > POST_ARGUS_CAP {
             // Sort indices by original weight DESC, then by source order for
             // determinism.
             let mut order: Vec<usize> = (0..self.post_additions.len()).collect();
