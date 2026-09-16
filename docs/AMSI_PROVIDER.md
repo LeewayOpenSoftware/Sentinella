@@ -104,12 +104,40 @@ regsvr32 sentinella_amsi_provider.dll
 regsvr32 /u sentinella_amsi_provider.dll
 ```
 
-> **Not done on any real machine in this work.** Per the task boundary, the
-> registration code and script are implemented but were **not** executed
-> against this host's HKLM. Registering needs explicit authorisation.
-
 Providers are loaded when a host process **starts**, so open a fresh
 PowerShell after registering.
+
+### Registration status on the human's machine (DONE 2026-09-16)
+
+With the human's authorisation, the provider **is registered** on their real
+machine. The release DLL was copied to `C:\Program Files\Sentinella\` (so the
+registered path survives a `target/` clean) and both keys were written and
+verified:
+
+```
+HKLM\SOFTWARE\Classes\CLSID\{53E6920C-21B6-4826-9752-81485B3CBA2A}\InprocServer32
+    = C:\Program Files\Sentinella\sentinella_amsi_provider.dll
+HKLM\SOFTWARE\Microsoft\AMSI\Providers\{53E6920C-21B6-4826-9752-81485B3CBA2A}
+    = Sentinella AMSI Provider
+```
+
+Confirmed live: a fresh PowerShell lists `sentinella_amsi_provider.dll` among
+its loaded modules (alongside `amsi.dll`) and runs normally — no hang, no
+crash. The standard AMSI test string returned `ScriptContainedMaliciousContent`
+while the daemon was up.
+
+**Attribution caveat.** Defender is also a registered AMSI provider, so a
+block seen at the host cannot, by itself, be credited to us — the verdict may
+come from Defender. The daemon-side counters added in §5.1 (`requests_total`
+via the `origin == "amsi"` path) are how we show a scan actually reached
+**our** provider. Defender must not be disabled to test this (it is the real
+AV on the machine).
+
+**Reversion:** to remove the registration, run elevated:
+
+```powershell
+pwsh scripts\amsi-register.ps1 -Unregister    # or: regsvr32 /u sentinella_amsi_provider.dll
+```
 
 ## 4. Manual verification (needs a real machine + admin)
 
