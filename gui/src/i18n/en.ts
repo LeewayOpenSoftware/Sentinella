@@ -431,6 +431,10 @@ export const en: Record<string, string> = {
   "notify.body_quarantined": "{file} ({virus}) has been moved to quarantine.",
   "notify.body_quar_storm": "Sentinella quarantined {count} files.",
   "notify.body_realtime": "The filesystem watcher could not start. New files are not being monitored.",
+  "notify.web_protection_unavailable": "Web protection stopped",
+  "notify.body_web_protection_unavailable": "The DNS filtering proxy stopped answering, so Sentinella removed the rule to keep your internet connection working. Filtering is currently off.",
+  "notify.web_protection_degraded": "Web protection: a DNS server isn't responding",
+  "notify.body_web_protection_degraded": "Filtering is still active, but one or more DNS servers used for lookups aren't responding — some resolutions may fail until they recover.",
 
   // ── Scan (extended) ────────────────────────────────
   "scan.starting": "Starting...",
@@ -790,6 +794,9 @@ export const en: Record<string, string> = {
   "notice.scan_done_clean": "{type} scan complete — {files} files clean",
   "notice.scan_done_threats": "{type} scan done — {threats} threat(s) found",
   "notice.view_quarantine": "View quarantine",
+  "notice.web_protection_stopped": "Web protection stopped — DNS reverted to normal, unfiltered resolution.",
+  "notice.web_protection_degraded": "Web protection: a DNS server isn't responding. Filtering is still active.",
+  "notice.view_web_protection": "View details",
 
   // ── Common ──────────────────────────────────────────
   "common.connected": "Connected",

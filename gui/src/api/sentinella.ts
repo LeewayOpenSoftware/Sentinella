@@ -363,11 +363,12 @@ export interface DashboardData {
   stats: RuntimeStats;
   scanHistory: ScanRecord[];
   idleScanner: IdleScannerStatus;
+  webProtection: WebProtectionStatus;
 }
 
 export async function fetchDashboard(): Promise<DashboardData> {
   // Each call is individually caught so one failure doesn't break the dashboard.
-  const [engine, scan, watcher, update, quarantine, activity, stats, scanHistory, idleScanner] =
+  const [engine, scan, watcher, update, quarantine, activity, stats, scanHistory, idleScanner, webProtection] =
     await Promise.all([
       getEngineStatus().catch(() => ({ state: "error" as const, protocol_version: 0, db_version: null, db_timestamp: null, signature_count: 0, last_update: null, engine_version: "?", reload_phase: "idle" as const })),
       getScanStatus().catch(() => ({ running: false, job_id: null, state: "idle" as const, scan_type: null, files_scanned: 0, files_total: 0, progress_percent: 0, threats_found: 0, current_path: null, scans_completed: 0, detections: [], started_at: null, finished_at: null, errors_count: 0 })),
@@ -378,8 +379,19 @@ export async function fetchDashboard(): Promise<DashboardData> {
       getRuntimeStats().catch(() => ({ uptime_secs: 0, uptime_human: "?", scans_completed: 0, threats_found_total: 0, ipc_requests_served: 0, quarantine_count: 0, activity_count: 0, started_at: 0, engine_loaded: false, signature_count: 0, db_stale: true, db_stale_hours: 0, db_stale_notify: false, watcher_active: false, last_update_timestamp: null, total_files_scanned: 0, total_detections: 0, argus_version: "?", argus_files_analyzed: 0, argus_threats_detected: 0, argus_active_layers: 0, argus_avg_analysis_us: 0, argus_yara_rules: 0, protection_state: "unprotected" as const, protection_detail: "Daemon unreachable", cache_hits: 0, cache_misses: 0, cache_entries: 0, idle_scanner_state: "disabled", idle_scanner_files: 0, ipc_reconnect_count: 0, ipc_last_error_ts: 0 })),
       getScanHistory().catch(() => []),
       getIdleScannerStatus().catch(() => ({ state: "disabled" as const, files_scanned_session: 0, current_target: "", last_pause_reason: "", last_completed: null })),
+      // Same "safe zeroed shape" convention as every other call above —
+      // `disabled`/`enabled:false` here means "we don't know", not "the
+      // user turned it off"; a genuinely-connected daemon always answers
+      // this call, so a caught failure here already means `connected`
+      // will be false too and this snapshot won't be committed anyway.
+      getWebProtectionStatus().catch(() => ({
+        enabled: false, nrpt_installed: null, state: "disabled" as const, listen: null,
+        upstreams: [], upstreams_healthy: 0, upstreams_total: 0, upstreams_degraded: [],
+        watchdog_fired: false, gpo_nrpt_present: null, rules_loaded: 0, detail: "",
+        queries: 0, blocked: 0, cache_hits: 0, upstream_errors: 0,
+      })),
     ]);
-  return { engine, scan, watcher, update, quarantine, activity, stats, scanHistory, idleScanner };
+  return { engine, scan, watcher, update, quarantine, activity, stats, scanHistory, idleScanner, webProtection };
 }
 
 // ── Notifications ───────────────────────────────────────────

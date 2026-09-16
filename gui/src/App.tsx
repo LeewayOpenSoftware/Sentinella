@@ -231,6 +231,49 @@ function App() {
           );
         }
       }
+
+      // Web protection: only worth a banner for a user who actually turned
+      // it on — the feature ships disabled by default, and a "protection
+      // stopped" banner for a feature nobody enabled would be exactly the
+      // fearware this project's notices otherwise avoid.
+      const wp = daemon.data?.webProtection;
+      if (wp?.enabled && notices.length < 3) {
+        if (wp.watchdog_fired) {
+          notices.push(
+            <TopBarNotice
+              key="wp-watchdog"
+              variant="warning"
+              message={t("notice.web_protection_stopped")}
+              dismissKey="wp-watchdog"
+              actions={
+                <button
+                  onClick={() => setPage("webprotection")}
+                  className="text-[10px] font-semibold text-[rgb(var(--accent))] hover:underline cursor-pointer whitespace-nowrap"
+                >
+                  {t("notice.view_web_protection")}
+                </button>
+              }
+            />
+          );
+        } else if ((wp.upstreams_degraded?.length ?? 0) > 0) {
+          notices.push(
+            <TopBarNotice
+              key="wp-degraded"
+              variant="warning"
+              message={t("notice.web_protection_degraded")}
+              dismissKey="wp-degraded"
+              actions={
+                <button
+                  onClick={() => setPage("webprotection")}
+                  className="text-[10px] font-semibold text-[rgb(var(--accent))] hover:underline cursor-pointer whitespace-nowrap"
+                >
+                  {t("notice.view_web_protection")}
+                </button>
+              }
+            />
+          );
+        }
+      }
     }
 
     // Priority 2: active scan progress.
@@ -288,7 +331,7 @@ function App() {
     }
 
     return notices;
-  }, [daemon.connected, daemon.connectionState, daemon.data?.stats, daemon.data?.scan, scanDoneNotice, dismissScanDone]);
+  }, [daemon.connected, daemon.connectionState, daemon.data?.stats, daemon.data?.scan, daemon.data?.webProtection, scanDoneNotice, dismissScanDone]);
 
   // First-run wizard gate.
   if (showWizard) {
