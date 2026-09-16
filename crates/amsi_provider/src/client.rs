@@ -38,6 +38,10 @@ pub fn build_request(
         "source_app": source_app,
         "content_name": content_name,
         "source_pid": source_pid,
+        // Marks the request as coming through the AMSI provider so the
+        // daemon can count/attribute it (vs. dev/CLI callers of the same
+        // method). See sentinelld ipc/state.rs record_amsi_scan.
+        "origin": "amsi",
     });
     if let Some(a) = auth {
         params["auth"] = serde_json::Value::String(a.to_string());
@@ -148,6 +152,7 @@ mod tests {
         assert_eq!(v["params"]["content"], "Write-Host hi");
         assert_eq!(v["params"]["language"], "powershell");
         assert_eq!(v["params"]["source_pid"], 1234);
+        assert_eq!(v["params"]["origin"], "amsi");
         assert!(v["params"]["auth"].is_string());
     }
 

@@ -2033,6 +2033,13 @@ fn dispatch_sync(
 
                 let total_score = result.score.saturating_add(plm_boost).min(100);
 
+                // Observability: count scans that came through the AMSI
+                // provider (origin=="amsi") so a block can be attributed to
+                // our provider vs. another registered one (e.g. Defender).
+                if req.params.get("origin").and_then(|v| v.as_str()) == Some("amsi") {
+                    crate::ipc::state::record_amsi_scan(result.should_block);
+                }
+
                 Ok(serde_json::json!({
                     "ok": true,
                     "score": total_score,
