@@ -34,6 +34,12 @@ struct CacheInner {
     access_counter: u64,
 }
 
+impl Default for TrustedCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrustedCache {
     pub fn new() -> Self {
         Self {

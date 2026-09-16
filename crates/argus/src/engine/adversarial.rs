@@ -128,7 +128,7 @@ fn burn_pe() -> Vec<u8> {
         .find(|s| s.name == ".wixburn")
         .unwrap()
         .raw_ptr as usize;
-    patch_u32_le(&mut data, base + 0x00, 0x00F1_4300); // BURN_SECTION_MAGIC
+    patch_u32_le(&mut data, base, 0x00F1_4300); // BURN_SECTION_MAGIC
     patch_u32_le(&mut data, base + 0x04, 2); // BURN_SECTION_VERSION
     patch_u32_le(&mut data, base + 0x18, pe.overlay_start as u32); // dwStubSize
     patch_u32_le(&mut data, base + 0x28, 1); // CABINET

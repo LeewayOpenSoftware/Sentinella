@@ -233,7 +233,7 @@ fn analyze_imports(pe: &PE, file_size: usize, findings: &mut Vec<Finding>) {
     let imports = &pe.imports;
     let total_functions: usize = imports.len();
     let unique_dlls: std::collections::HashSet<&str> =
-        imports.iter().map(|imp| imp.dll.as_ref()).collect();
+        imports.iter().map(|imp| imp.dll).collect();
 
     // Very few imports — suspicious if binary is large.
     if total_functions <= 5 && total_functions > 0 {
@@ -741,7 +741,7 @@ fn analyze_section_names(pe: &PE, findings: &mut Vec<Finding>) {
         }
 
         // Check if name looks like garbage (non-printable or random characters).
-        let non_printable = name.bytes().filter(|&b| b < 0x20 || b > 0x7E).count();
+        let non_printable = name.bytes().filter(|&b| !(0x20..=0x7E).contains(&b)).count();
         let has_garbage = non_printable > 0
             || (name.len() >= 4
                 && !name.contains('.')

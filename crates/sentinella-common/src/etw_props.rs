@@ -481,7 +481,7 @@ mod tests {
         for i in 0..4096 {
             let pick = |rng: &mut XorShift| {
                 let r = rng.next();
-                if r % 2 == 0 {
+                if r.is_multiple_of(2) {
                     MAGNETS[(r >> 32) as usize % MAGNETS.len()]
                 } else {
                     r

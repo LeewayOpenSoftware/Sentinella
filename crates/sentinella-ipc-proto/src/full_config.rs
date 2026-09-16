@@ -685,7 +685,7 @@ mod tests {
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed: FullConfig = serde_json::from_str(&json).expect("deserialize");
         // Spot-check a few representative fields.
-        assert_eq!(parsed.realtime_enabled, true);
+        assert!(parsed.realtime_enabled);
         assert_eq!(parsed.max_file_size_mb, 512);
         assert_eq!(parsed.fish.window_seconds, 30);
         assert_eq!(parsed.sandbox.min_score, 26);

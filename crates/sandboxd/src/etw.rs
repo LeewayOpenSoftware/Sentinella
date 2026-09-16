@@ -508,7 +508,7 @@ fn is_persistence_key(path: &str) -> bool {
 fn classify_port_severity(port: u16) -> &'static str {
     if port == 4444 {
         "critical"
-    } else if port >= 1 && port <= 1024 {
+    } else if (1..=1024).contains(&port) {
         "high"
     } else if port > 49152 {
         "medium"
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn dedup_logic() {
-        let existing = vec![EtwFinding {
+        let existing = [EtwFinding {
             kind: "process_spawn".into(),
             severity: "high".into(),
             detail: "Spawned cmd.exe".into(),

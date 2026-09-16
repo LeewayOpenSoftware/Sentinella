@@ -445,8 +445,10 @@ impl ConfidenceLabel {
 /// Chain strength — how coherent and dangerous a detected behavior chain is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ChainStrength {
     /// No coherent chain detected.
+    #[default]
     None,
     /// Weak chain: common combinations that may be benign (downloader + context).
     Weak,
@@ -456,11 +458,6 @@ pub enum ChainStrength {
     Strong,
 }
 
-impl Default for ChainStrength {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Convergence info passed from engine to verdict.
 #[derive(Debug, Clone, Default)]
@@ -1023,7 +1020,7 @@ pub fn attack_progression_score(tags: &[BehaviorTag]) -> u8 {
     let mut transitions: u8 = 0;
     for window in stages.windows(2) {
         let gap = window[1] - window[0];
-        if gap >= 1 && gap <= 4 {
+        if (1..=4).contains(&gap) {
             transitions += 1;
         }
     }
