@@ -1414,6 +1414,7 @@ fn fish_handle_burst(
                 return;
             }
 
+            #[allow(clippy::never_loop)]
             for suspect in &suspects {
                 let action_name = if response_mode == ResponseType::Suspend {
                     "suspend"
