@@ -47,6 +47,8 @@ export function AboutPage() {
         <img
           src={aboutBanner}
           alt="Sentinella cinematic banner"
+          loading="lazy"
+          decoding="async"
           className="absolute inset-0 h-full w-full object-cover object-center"
         />
         <div className="absolute inset-0 bg-gradient-to-r from-black/40 via-black/10 to-black/30" />
@@ -96,9 +98,9 @@ export function AboutPage() {
             {t("about.license_p2")}
           </p>
           <div className="flex gap-4">
-            <ExtLink label={t("about.source_code")} />
-            <ExtLink label="ClamAV" />
-            <ExtLink label="GPLv2" />
+            <ExtLink label={t("about.source_code")} href="https://github.com/nicfb/sentinella" />
+            <ExtLink label="ClamAV" href="https://www.clamav.net/" />
+            <ExtLink label="GPLv2" href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.html" />
           </div>
         </Card>
       </div>
@@ -197,9 +199,9 @@ function AR({ l, v }: { l: string; v: string }) {
   );
 }
 
-function ExtLink({ label }: { label: string }) {
+function ExtLink({ label, href }: { label: string; href: string }) {
   return (
-    <a href="#" className="text-[11px] text-[rgb(var(--accent))] flex items-center gap-1 hover:underline">
+    <a href={href} target="_blank" rel="noopener noreferrer" className="text-[11px] text-[rgb(var(--accent))] flex items-center gap-1 hover:underline">
       <ExternalLink size={10} />{label}
     </a>
   );
