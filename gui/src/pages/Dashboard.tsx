@@ -261,7 +261,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
         </div>
       </Card>
 
-      <div className="card-grid-4">
+      <div className="card-grid-5">
         <StatusTile
           label={t("tile.realtime")}
           value={watcher.enabled ? t("tile.active") : t("tile.disabled")}
@@ -388,8 +388,8 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                     <p className="text-[13px] font-medium">{entry.title}</p>
                     {entry.message && <p className="mt-1 text-[11px] text-[rgb(var(--t3))]">{entry.message}</p>}
                   </div>
-                  <span className="mt-1 flex-shrink-0 text-[10px] text-[rgb(var(--t3))]">
-                    {new Date(entry.timestamp * 1000).toLocaleTimeString()}
+                  <span className="mt-1 flex-shrink-0 text-[10px] text-[rgb(var(--t3))]" title={new Date(entry.timestamp * 1000).toLocaleString()}>
+                    {formatRelativeTime(entry.timestamp)}
                   </span>
                 </div>
               );
@@ -405,6 +405,14 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
       </Card>
     </div>
   );
+}
+
+function formatRelativeTime(unixSeconds: number): string {
+  const diff = Math.floor(Date.now() / 1000 - unixSeconds);
+  if (diff < 60) return t("notif.just_now");
+  if (diff < 3600) return t("notif.minutes_ago").replace("{n}", String(Math.floor(diff / 60)));
+  if (diff < 86400) return t("notif.hours_ago").replace("{n}", String(Math.floor(diff / 3600)));
+  return t("notif.days_ago").replace("{n}", String(Math.floor(diff / 86400)));
 }
 
 function HeroDetail({ label, value, sub }: { label: string; value: string; sub: string }) {

@@ -308,6 +308,25 @@ button { transition: all 0.15s ease; }
   gap: var(--card-gap);
 }
 
+/*
+ * Status tile row: 5 tiles. `card-grid-4`'s auto-fill(180px) leaves the 5th
+ * tile stranded alone on its own row at common desktop widths (~900-1200px,
+ * exactly 4 tracks fit). Explicit 3-column default means 5 tiles split 3+2
+ * — never a lone orphan — before jumping to a full 5-across row on wide
+ * displays.
+ */
+.card-grid-5 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--card-gap);
+}
+
+@media (min-width: 1400px) {
+  .card-grid-5 {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 1200px) {
   .card-grid-4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -317,6 +336,7 @@ button { transition: all 0.15s ease; }
 @media (max-width: 860px) {
   .card-grid-4,
   .card-grid-2,
+  .card-grid-5,
   .dash-secondary-row {
     grid-template-columns: minmax(0, 1fr);
   }
