@@ -208,14 +208,26 @@ export function QuarantinePage() {
           {items.map((item, idx) => {
             const exp = expanded === item.id;
             const isBusy = busy === item.id;
+            const isArgus = item.signature.startsWith("ARGUS/");
+            const scoreMatch = item.signature.match(/\[(\d+)\/100\]/);
+            const score = scoreMatch ? parseInt(scoreMatch[1]) : null;
+            const cleanSignature = item.signature.replace(/\s*\[\d+\/100\]/, "");
             return (
               <div key={item.id} className={idx > 0 ? "border-t border-[rgb(var(--border))]/8" : ""}>
                 <button onClick={() => setExpanded(exp ? null : item.id)} className="w-full flex items-center gap-4 py-4 text-left cursor-pointer hover:bg-[rgb(var(--raised))]/10 transition-colors px-1 rounded-lg">
                   <FileWarning size={16} className="text-[rgb(var(--red))] flex-shrink-0" />
                   <div className="flex-1 min-w-0">
                     <p className="text-[13px] font-medium">{item.original_path.split('\\').pop()}</p>
-                    <p className="text-[11px] text-[rgb(var(--t3))]/40 truncate">{item.signature}</p>
+                    <p className="text-[11px] text-[rgb(var(--t3))]/40 truncate">{cleanSignature}</p>
                   </div>
+                  {score !== null && (
+                    <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))] flex-shrink-0" title={t("quar.argus_score_tooltip")}>
+                      {score}/100
+                    </span>
+                  )}
+                  <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded flex-shrink-0 ${isArgus ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"}`}>
+                    {isArgus ? t("scan.heuristic") : t("scan.signature")}
+                  </span>
                   <p className="text-[11px] text-[rgb(var(--t3))]/30">{new Date(item.quarantined_at * 1000).toLocaleDateString()}</p>
                   {exp ? <ChevronUp size={14} className="text-[rgb(var(--t3))]/25"/> : <ChevronDown size={14} className="text-[rgb(var(--t3))]/25"/>}
                 </button>
@@ -223,10 +235,15 @@ export function QuarantinePage() {
                   <div className="pb-4 pl-10">
                     <div className="mb-4 grid gap-x-8 gap-y-3 text-[12px] md:grid-cols-2">
                       <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_path")}</p><p className="font-medium truncate">{item.original_path}</p></div>
-                      <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_detection")}</p><p className="font-medium">{item.signature}</p></div>
+                      <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_detection")}</p><p className="font-medium">{cleanSignature}</p></div>
                       <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_sha256")}</p><p className="font-mono text-[11px]">{item.sha256.slice(0, 24)}...</p></div>
                       <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_size")}</p><p className="font-medium">{item.original_size.toLocaleString()} {t("quar.bytes")}</p></div>
                     </div>
+                    <p className="mb-4 text-[11px] leading-relaxed text-[rgb(var(--t3))]">
+                      {isArgus
+                        ? (score !== null ? t("quar.why_argus_scored").replace("{score}", String(score)) : t("quar.why_argus"))
+                        : t("quar.why_signature")}
+                    </p>
                     <div className="flex gap-3 flex-wrap">
                       <button
                         disabled={!item.restorable || isBusy}

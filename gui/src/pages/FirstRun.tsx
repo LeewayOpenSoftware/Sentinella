@@ -30,6 +30,21 @@ function markComplete() {
   localStorage.setItem(STORAGE_KEY, "true");
 }
 
+function StepDots({ current }: { current: 0 | 1 | 2 }) {
+  return (
+    <div className="flex items-center justify-center gap-2 mb-8" aria-hidden="true">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className={`h-1.5 rounded-full transition-all duration-300 ${
+            i === current ? "w-6 bg-[rgb(var(--accent))]" : "w-1.5 bg-[rgb(var(--raised))]/60"
+          }`}
+        />
+      ))}
+    </div>
+  );
+}
+
 export function FirstRunWizard({ onComplete }: { onComplete: () => void }) {
   const [step, setStep] = useState<Step>("welcome");
   const [engine, setEngine] = useState<EngineStatus | null>(null);
@@ -86,9 +101,11 @@ export function FirstRunWizard({ onComplete }: { onComplete: () => void }) {
     <div className="flex h-screen items-center justify-center bg-[rgb(var(--base))]">
       <div className="w-full max-w-lg px-6">
 
+        <StepDots current={step === "welcome" ? 0 : step === "signatures" ? 1 : 2} />
+
         {/* ── Welcome ── */}
         {step === "welcome" && (
-          <div className="text-center">
+          <div className="text-center animate-in fade-in">
             <div className="flex h-20 w-20 mx-auto items-center justify-center rounded-3xl bg-gradient-to-br from-[rgb(var(--accent))] to-[rgb(var(--accent))]/60 mb-8 shadow-lg shadow-[rgb(var(--accent))]/10">
               <Shield size={36} className="text-white" />
             </div>
@@ -109,17 +126,23 @@ export function FirstRunWizard({ onComplete }: { onComplete: () => void }) {
                 <Loader2 size={14} className="animate-spin" />
               </div>
             ) : (
-              <button onClick={() => setStep("signatures")}
-                className="flex items-center justify-center gap-2.5 mx-auto px-8 py-3.5 rounded-xl bg-[rgb(var(--accent))] text-white text-[14px] font-semibold hover:opacity-90 cursor-pointer shadow-sm shadow-[rgb(var(--accent))]/15">
-                {tf("firstrun.get_started", "Get Started")} <ArrowRight size={16} />
-              </button>
+              <>
+                <button onClick={() => setStep("signatures")}
+                  className="flex items-center justify-center gap-2.5 mx-auto px-8 py-3.5 rounded-xl bg-[rgb(var(--accent))] text-white text-[14px] font-semibold hover:opacity-90 cursor-pointer shadow-sm shadow-[rgb(var(--accent))]/15">
+                  {tf("firstrun.get_started", "Get Started")} <ArrowRight size={16} />
+                </button>
+                <button onClick={finish}
+                  className="mx-auto mt-5 block text-[12px] text-[rgb(var(--t3))] hover:text-[rgb(var(--t1))] cursor-pointer">
+                  {tf("firstrun.skip_setup", "Skip setup")}
+                </button>
+              </>
             )}
           </div>
         )}
 
         {/* ── Signatures ── */}
         {step === "signatures" && (
-          <div>
+          <div className="animate-in fade-in">
             <div className="flex items-center gap-3 mb-6">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
                 <RefreshCw size={18} className="text-[rgb(var(--accent))]" />
@@ -194,7 +217,7 @@ export function FirstRunWizard({ onComplete }: { onComplete: () => void }) {
 
         {/* ── Optional Scan ── */}
         {step === "scan" && (
-          <div>
+          <div className="animate-in fade-in">
             <div className="flex items-center gap-3 mb-6">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
                 <Search size={18} className="text-[rgb(var(--accent))]" />

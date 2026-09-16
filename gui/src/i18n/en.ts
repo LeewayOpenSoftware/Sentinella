@@ -373,6 +373,10 @@ export const en: Record<string, string> = {
   "quar.restore_as": "Restore as...",
   "quar.restore_as_tooltip": "Restore to a different location",
   "quar.restore_dialog_title": "Restore quarantined file to...",
+  "quar.argus_score_tooltip": "ARGUS suspicion score at time of detection",
+  "quar.why_argus_scored": "Flagged by ARGUS's heuristic engine with a suspicion score of {score}/100 — not a known-virus signature match, but behavior and structure consistent with malware.",
+  "quar.why_argus": "Flagged by ARGUS's heuristic engine — behavior and structure consistent with malware, not a known-virus signature match.",
+  "quar.why_signature": "Matched a known-virus signature in the ClamAV database.",
 
   // ── Notification dispatch (toasts) ───────────────────
   "notify.threat_detected": "Threat detected",
