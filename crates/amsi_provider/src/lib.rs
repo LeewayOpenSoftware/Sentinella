@@ -12,17 +12,19 @@
 //! - `com` (Windows only): implements [`IAntimalwareProvider`] plus an
 //!   `IClassFactory` and the `Dll*` COM entry points. This is the code
 //!   Windows actually loads.
-//! - `decision`, `budget`, `client`, `registration`: pure logic split out
-//!   so the parts that matter for correctness — the fail-open policy, the
-//!   time budget, the request/response framing, the registry strings — are
+//! - `decision`, `decode`, `executor`, `client`, `registration`: pure logic
+//!   split out so the parts that matter for correctness — the fail-open
+//!   policy, the UTF-16LE/UTF-8 content decode, the pooled+circuit-broken
+//!   execution, the request/response framing, the registry strings — are
 //!   unit-tested without a COM host.
 //!
 //! # Hard constraints (it runs inside other people's processes)
 //!
 //! - **Never panic across the COM boundary.** A panic would corrupt the
 //!   host's stack; `Scan` wraps its whole body in `catch_unwind`.
-//! - **Never block.** The daemon round-trip runs under a strict wall-clock
-//!   budget on a scratch thread; missing it fails open.
+//! - **Never block.** The daemon round-trip runs on a small persistent
+//!   worker pool with a circuit breaker (never a thread per scan); missing
+//!   the wall-clock budget fails open.
 //! - **Fail OPEN.** If the daemon is slow, down, or unreachable, return
 //!   `AMSI_RESULT_NOT_DETECTED`. This is the ONE place in Sentinella where
 //!   fail-open is correct: blocking Word or PowerShell on a timeout is
@@ -32,9 +34,10 @@
 //! over the existing named-pipe IPC), so the full engine never has to load
 //! inside each host process.
 
-pub mod budget;
 pub mod client;
 pub mod decision;
+pub mod decode;
+pub mod executor;
 pub mod registration;
 
 #[cfg(windows)]

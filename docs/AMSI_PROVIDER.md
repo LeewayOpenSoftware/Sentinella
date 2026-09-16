@@ -29,10 +29,22 @@ DLL runs inside Word, PowerShell, `wscript`, etc. — not inside our service.
 
 The DLL implements `IAntimalwareProvider` (`Scan`, `CloseSession`,
 `DisplayName`) plus an `IClassFactory` and the standard COM `Dll*` exports.
-It reads the script bytes from the `IAmsiStream` (the `CONTENT_ADDRESS` /
-`CONTENT_SIZE` / `APP_NAME` / `CONTENT_NAME` attributes) and forwards them
-to the daemon. **The engine never loads into the host process** — the
-verdict comes back over IPC.
+It reads the script bytes from the `IAmsiStream` — from the `CONTENT_ADDRESS`
+buffer when available, otherwise via `IAmsiStream::Read` (both bounded by
+`MAX_CONTENT`) — plus the `APP_NAME` / `CONTENT_NAME` attributes, and
+forwards them to the daemon. **The engine never loads into the host
+process** — the verdict comes back over IPC.
+
+### Content encoding (important)
+
+AMSI does not expose the content's text encoding. PowerShell submits its
+buffer as **UTF-16LE**; other hosts commonly submit UTF-8/ASCII. Decoding
+UTF-16LE as UTF-8 is silently destructive — the NUL high byte of each ASCII
+code unit is a valid UTF-8 `U+0000`, so `Invoke-Expression` would reach the
+daemon as `I\0n\0v\0o\0k\0e\0-\0…` and no rule would match. The provider
+therefore **detects the encoding** (`decode::looks_like_utf16le`: even
+length + a strong majority of NUL high-bytes, or a UTF-16LE BOM) and decodes
+UTF-16LE properly, falling back to UTF-8 otherwise.
 
 ### Reuse, not reinvention
 
@@ -59,8 +71,15 @@ unreachable, **blocking the host is worse than missing one detection** — a
 hung provider hangs the user's editor. So:
 
 - Every `Scan` returns within a hard **250 ms** wall-clock budget. The
-  daemon round-trip runs on a scratch thread (`budget::run_with_budget`);
-  if it overruns, the thread is abandoned and we return `NOT_DETECTED`.
+  daemon round-trip runs on a small **fixed pool** of persistent workers
+  (`executor`), never a thread per scan — PowerShell scans almost every
+  command, so spawn-per-call would be high-frequency thread creation inside
+  the host. If a scan overruns, we return `NOT_DETECTED`.
+- A **circuit breaker** protects the host from a wedged daemon: after a few
+  consecutive budget overruns it short-circuits to `NOT_DETECTED` for a
+  cool-down window without touching a worker, so a stuck daemon cannot pile
+  up blocked threads. When all workers are saturated the scan is shed
+  (also `NOT_DETECTED`).
 - Any error — no daemon, pipe error, malformed reply, RPC error, missing
   auth secret — returns `NOT_DETECTED`.
 - `Scan` is wrapped in `catch_unwind`; a panic can never unwind into the
@@ -159,15 +178,21 @@ pwsh scripts\amsi-register.ps1 -Unregister    # or: regsvr32 /u sentinella_amsi_
 
 ## 5. What is tested automatically vs. what needs a machine
 
-Automated (`cargo test -p amsi_provider`), no COM host required:
+Automated (`cargo test -p amsi_provider`, 28 tests), no COM host required:
 
+- **Content decode** (`decode`): a UTF-16LE `Invoke-Expression` buffer
+  decodes to the real string (and the old UTF-8 path is shown NOT to contain
+  it); BOM stripping; UTF-8 ASCII and UTF-8 multibyte pass through unchanged;
+  odd-length falls back to UTF-8.
 - **Verdict mapping / fail-open policy** (`decision`): block → DETECTED;
   clean/high-score-without-block → NOT_DETECTED; **no verdict → NOT_DETECTED**.
-- **Timeout fail-open** (`budget`): a round-trip that overruns the budget
-  yields `None` (→ NOT_DETECTED), and returns long before the slow worker.
+- **Executor** (`executor`): the circuit breaker opens after the timeout
+  threshold and reopens/closes on cool-down and success; a fast job returns
+  its value; a slow job fails open within the budget; the pool recovers
+  after a single timeout (one slow scan does not wedge the next).
 - **Request/response framing** (`client`): `runtime.scan_buffer` request is
-  well-formed JSON-RPC with auth; responses (block/clean/rpc-error/`ok:false`/
-  garbage) parse to the right verdict or to fail-open.
+  well-formed JSON-RPC with auth and `origin:"amsi"`; responses (block/clean/
+  rpc-error/`ok:false`/garbage) parse to the right verdict or to fail-open.
 - **Registration strings** (`registration`): CLSID shape, subkeys, and the
   `.reg` body (InprocServer32, ThreadingModel, AMSI\Providers, DLL path).
 - **App→language mapping** (`lib`).

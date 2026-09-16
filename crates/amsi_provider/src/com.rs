@@ -2,15 +2,14 @@
 //! class factory, and the `Dll*` entry points Windows calls. Windows-only,
 //! built against the `windows` 0.61 `#[implement]` contract.
 //!
-//! Everything here is thin glue over the pure logic in `decision`,
-//! `budget`, `client` and `registration`. The crate-doc rules are enforced
+//! Everything here is thin glue over the pure logic in `decision`, `decode`,
+//! `executor`, `client` and `registration`. The crate-doc rules are enforced
 //! at exactly one place each:
 //! - `Scan` wraps its whole body in `catch_unwind` (never panic into the
 //!   host) and returns `Ok(NOT_DETECTED)` on any failure (fail open).
-//! - the daemon round-trip runs under [`budget::run_with_budget`].
+//! - the daemon round-trip runs on a pooled, circuit-broken executor.
 
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use windows::core::{implement, BOOL, GUID, HRESULT, Interface, IUnknown, PCWSTR, PWSTR, Ref, Result};
 use windows::Win32::Foundation::{
@@ -30,15 +29,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
-use crate::budget::run_with_budget;
 use crate::client;
 use crate::decision::{decision_from_outcome, ProviderDecision};
 use crate::registration;
-
-/// Hard wall-clock budget for the whole daemon round-trip. Miss it and we
-/// return NOT_DETECTED — blocking the host on a slow/dead daemon is worse
-/// than missing one detection.
-const SCAN_BUDGET: Duration = Duration::from_millis(250);
 
 /// Upper bound on script content we forward (matches the daemon's own
 /// runtime-buffer cap and the IPC frame limit).
@@ -84,24 +77,37 @@ impl IAntimalwareProvider_Impl for SentinellaAmsiProvider_Impl {
         // Word/PowerShell. Any failure resolves to NOT_DETECTED.
         let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let size = attr_u64(stream, AMSI_ATTRIBUTE_CONTENT_SIZE).unwrap_or(0) as usize;
-            if size == 0 || size > MAX_CONTENT {
+            if size > MAX_CONTENT {
                 return ProviderDecision::NotDetected;
             }
-            let addr = match attr_u64(stream, AMSI_ATTRIBUTE_CONTENT_ADDRESS) {
-                Some(a) if a != 0 => a as *const u8,
-                _ => return ProviderDecision::NotDetected,
+
+            // Finding 2: CONTENT_ADDRESS may be unavailable — the AMSI
+            // contract then requires reading the content via the stream.
+            // Both paths are bounded by MAX_CONTENT.
+            let content: Vec<u8> = match attr_u64(stream, AMSI_ATTRIBUTE_CONTENT_ADDRESS) {
+                Some(a) if a != 0 && size > 0 => {
+                    std::slice::from_raw_parts(a as *const u8, size).to_vec()
+                }
+                _ => read_stream(stream, size, MAX_CONTENT),
             };
-            let content = std::slice::from_raw_parts(addr, size);
-            let text = String::from_utf8_lossy(content).into_owned();
+            if content.is_empty() {
+                return ProviderDecision::NotDetected;
+            }
+
+            // Finding 1: AMSI content is NOT always UTF-8. PowerShell submits
+            // UTF-16LE; decoding it as UTF-8 leaves a NUL between every char
+            // and nothing in the engine matches. Detect and decode properly.
+            let text = crate::decode::decode_amsi_content(&content);
             let app = attr_wstr(stream, AMSI_ATTRIBUTE_APP_NAME).unwrap_or_default();
             let name = attr_wstr(stream, AMSI_ATTRIBUTE_CONTENT_NAME).unwrap_or_default();
             let language = crate::language_from_app(&app);
             let pid = std::process::id();
 
-            let outcome = run_with_budget(SCAN_BUDGET, move || {
+            // Finding 3: pooled + circuit-broken execution, never a thread
+            // per scan.
+            let outcome = crate::executor::run_scan(move || {
                 client::scan_once(&text, language, &app, &name, pid)
-            })
-            .flatten();
+            });
 
             decision_from_outcome(outcome)
         }))
@@ -133,6 +139,29 @@ unsafe fn attr_u64(stream: &IAmsiStream, attr: AMSI_ATTRIBUTE) -> Option<u64> {
     let mut b = [0u8; 8];
     b[..n].copy_from_slice(&buf[..n]);
     Some(u64::from_ne_bytes(b))
+}
+
+/// Read content via `IAmsiStream::Read` when `CONTENT_ADDRESS` is not
+/// available (Finding 2). Bounded by `max`; `hint` is CONTENT_SIZE if known.
+unsafe fn read_stream(stream: &IAmsiStream, hint: usize, max: usize) -> Vec<u8> {
+    let target = if hint > 0 { hint.min(max) } else { max };
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut pos: u64 = 0;
+    while out.len() < target {
+        let want = chunk.len().min(target - out.len());
+        let mut readsize: u32 = 0;
+        if unsafe { stream.Read(pos, &mut chunk[..want], &mut readsize) }.is_err() {
+            break;
+        }
+        let n = (readsize as usize).min(want);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+        pos += n as u64;
+    }
+    out
 }
 
 /// Read a UTF-16 string attribute (APP_NAME / CONTENT_NAME).
