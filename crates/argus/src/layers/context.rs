@@ -105,7 +105,7 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
                 if let Some(url) = zone_data
                     .lines()
                     .find(|l| l.starts_with("ReferrerUrl=") || l.starts_with("HostUrl="))
-                    .map(|l| l.splitn(2, '=').nth(1).unwrap_or("").to_string())
+                    .map(|l| l.split_once('=').map(|x| x.1).unwrap_or("").to_string())
                 {
                     let url_lower = url.to_lowercase();
 

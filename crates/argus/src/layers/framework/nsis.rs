@@ -449,7 +449,7 @@ mod tests {
     fn nsis_overlay_no_crc(payload_len: u32, trailing: &[u8]) -> Vec<u8> {
         let arc_size = FIRSTHEADER_LEN as u32 + payload_len;
         let mut v = firstheader(FH_FLAGS_NO_CRC, 0x100, arc_size);
-        v.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        v.extend(std::iter::repeat_n(0xCC, payload_len as usize));
         v.extend_from_slice(trailing);
         v
     }
@@ -460,7 +460,7 @@ mod tests {
     fn nsis_pe_with_crc(payload_len: u32, trailing: &[u8]) -> Vec<u8> {
         let arc_size = FIRSTHEADER_LEN as u32 + payload_len + 4;
         let mut overlay = firstheader(0, 0x100, arc_size);
-        overlay.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        overlay.extend(std::iter::repeat_n(0xCC, payload_len as usize));
         overlay.extend_from_slice(&[0u8; 4]); // CRC placeholder
         overlay.extend_from_slice(trailing);
         let mut data = base_pe(&overlay);
@@ -527,7 +527,7 @@ mod tests {
     fn uninstaller_flag_is_detected_and_noted() {
         let arc_size = FIRSTHEADER_LEN as u32 + 64;
         let mut overlay = firstheader(FH_FLAGS_UNINSTALL | FH_FLAGS_NO_CRC, 0x80, arc_size);
-        overlay.extend(std::iter::repeat(0x42).take(64));
+        overlay.extend(std::iter::repeat_n(0x42, 64));
         let data = base_pe(&overlay);
         let d = run(&data);
         assert_eq!(d.confidence(), Confidence::Structural);
@@ -675,7 +675,7 @@ mod tests {
         // ArcSize = INT32_MAX with a small overlay — exehead's
         // "length_of_all_following_data > remaining" check must fire.
         let mut overlay = firstheader(FH_FLAGS_NO_CRC, 0x100, MAX_INT_FIELD);
-        overlay.extend(std::iter::repeat(0x55).take(256));
+        overlay.extend(std::iter::repeat_n(0x55, 256));
         let data = base_pe(&overlay);
         let d = run(&data);
         assert!(d.confidence() <= Confidence::WeakHint);
@@ -687,7 +687,7 @@ mod tests {
         // ArcSize <= sizeof(firstheader): 7-Zip rejects; a real archive
         // always carries at least the compressed header block.
         let mut overlay = firstheader(FH_FLAGS_NO_CRC, 0x100, FIRSTHEADER_LEN as u32);
-        overlay.extend(std::iter::repeat(0x55).take(64));
+        overlay.extend(std::iter::repeat_n(0x55, 64));
         let data = base_pe(&overlay);
         let d = run(&data);
         assert!(d.confidence() <= Confidence::WeakHint);
@@ -698,7 +698,7 @@ mod tests {
     fn zero_header_length_is_rejected() {
         let arc_size = FIRSTHEADER_LEN as u32 + 64;
         let mut overlay = firstheader(FH_FLAGS_NO_CRC, 0, arc_size);
-        overlay.extend(std::iter::repeat(0x55).take(64));
+        overlay.extend(std::iter::repeat_n(0x55, 64));
         let data = base_pe(&overlay);
         let d = run(&data);
         assert!(d.confidence() <= Confidence::WeakHint);
@@ -709,7 +709,7 @@ mod tests {
     fn flags_outside_mask_are_rejected() {
         let arc_size = FIRSTHEADER_LEN as u32 + 64;
         let mut overlay = firstheader(0x10, 0x100, arc_size);
-        overlay.extend(std::iter::repeat(0x55).take(64));
+        overlay.extend(std::iter::repeat_n(0x55, 64));
         let data = base_pe(&overlay);
         let d = run(&data);
         assert!(d.confidence() <= Confidence::WeakHint);

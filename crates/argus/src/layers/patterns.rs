@@ -498,9 +498,7 @@ fn detect_fake_game_mod(path: &str, hits: &HashSet<usize>, findings: &mut Vec<Fi
             layer: Layer::PatternDetection,
             severity: Severity::Critical,
             weight: 45,
-            description: format!(
-                "Executable presents as a game modification tool but contains credential harvesting capabilities — this is a textbook fake game mod stealer."
-            ),
+            description: "Executable presents as a game modification tool but contains credential harvesting capabilities — this is a textbook fake game mod stealer.".to_string(),
             technical_detail: Some(format!("Game keywords + mod keywords + {steal_indicators} credential theft indicators in binary")),
         });
     } else if (has_game || has_mod) && steal_indicators >= 3 {

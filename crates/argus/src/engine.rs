@@ -1510,7 +1510,7 @@ mod tests {
         overlay.extend_from_slice(b"NullsoftInst");
         overlay.extend_from_slice(&0x100u32.to_le_bytes()); // length_of_header
         overlay.extend_from_slice(&arc_size.to_le_bytes()); // length_of_all_following_data
-        overlay.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        overlay.extend(std::iter::repeat_n(0xCC, payload_len as usize));
         PeBuilder::new()
             .add_section(SectionSpec::new(".text", 0x200, 0x200).raw_ptr_override(0x200))
             .overlay(&overlay)
@@ -1528,7 +1528,7 @@ mod tests {
         overlay.extend_from_slice(b"NullsoftInst");
         overlay.extend_from_slice(&0x100u32.to_le_bytes());
         overlay.extend_from_slice(&arc_size.to_le_bytes());
-        overlay.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        overlay.extend(std::iter::repeat_n(0xCC, payload_len as usize));
         overlay.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // bogus stored CRC
         PeBuilder::new()
             .add_section(SectionSpec::new(".text", 0x200, 0x200).raw_ptr_override(0x200))
@@ -2205,7 +2205,7 @@ mod tests {
     #[test]
     fn test_yara_rules_compile_cleanly() {
         // Verify all YARA rules in the runtime directory compile.
-        let dirs = vec![std::path::PathBuf::from("../../runtime/argus/rules/yara")];
+        let dirs = [std::path::PathBuf::from("../../runtime/argus/rules/yara")];
         let existing_dirs: Vec<_> = dirs.iter().filter(|d| d.exists()).cloned().collect();
         if existing_dirs.is_empty() {
             // Skip in CI where runtime dir may not exist.

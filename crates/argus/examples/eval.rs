@@ -886,7 +886,7 @@ fn main() {
                         f.layer,
                         f.severity,
                         f.weight,
-                        f.description.replace('\t', " ").replace('\n', " "),
+                        f.description.replace(['\t', '\n'], " "),
                     );
                 }
             }

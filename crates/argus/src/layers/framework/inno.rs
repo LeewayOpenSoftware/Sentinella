@@ -628,7 +628,7 @@ mod tests {
             offset0,
             offset1,
         );
-        data.extend(std::iter::repeat(0xAA).take(tail_extra));
+        data.extend(std::iter::repeat_n(0xAA, tail_extra));
         InnoFixture {
             data,
             table_off,

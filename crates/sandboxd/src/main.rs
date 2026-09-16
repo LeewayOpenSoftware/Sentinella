@@ -763,7 +763,8 @@ fn launch_and_monitor(
 
         // Collect ETW results.
         etw_handle.join().unwrap_or_else(|_| {
-            let r = etw::EtwReport {
+            
+            etw::EtwReport {
                 findings: vec![],
                 processes_spawned: vec![],
                 dlls_loaded: vec![],
@@ -774,8 +775,7 @@ fn launch_and_monitor(
                 backend_used: "error".into(),
                 events_seen: 0,
                 etw_degraded: false,
-            };
-            r
+            }
         })
     };
 
