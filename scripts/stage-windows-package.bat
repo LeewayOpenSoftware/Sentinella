@@ -54,6 +54,13 @@ if exist "%TARGET%\argusd.exe" (
     echo        [WARN] argusd.exe not found - run: cargo build --release -p argusd
 )
 
+if exist "%TARGET%\sentinella-dnsreconcile.exe" (
+    copy /Y "%TARGET%\sentinella-dnsreconcile.exe" "%STAGE%\" >nul
+    echo        sentinella-dnsreconcile.exe OK
+) else (
+    echo        [WARN] sentinella-dnsreconcile.exe not found - run: cargo build --release -p sentinella-dnsreconcile
+)
+
 :: ── ClamAV DLLs ──
 echo  [2/8] ClamAV DLLs...
 set "DLL_FOUND=0"
