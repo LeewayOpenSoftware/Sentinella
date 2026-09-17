@@ -84,15 +84,27 @@ pub fn launch_restricted(sample: &Path, cwd: &Path) -> RestrictedLaunch {
     }
 
     // Set low integrity level via raw SetTokenInformation.
-    let low_integrity = match set_low_integrity(restricted_token) {
-        Ok(()) => true,
-        Err(e) => {
-            errors.push(format!(
-                "Low integrity failed: {e} — using restricted without low integrity"
-            ));
-            false
+    //
+    // SR-02 (fail-open closed): low integrity is one of the THREE real
+    // containment layers (see the containment model above — Job Object +
+    // network block + low integrity; the token only reduces privilege, not
+    // identity). The v1.0 code CONTINUED to detonate when this failed, so a
+    // sample could run at the sandbox's own (SYSTEM-derived) integrity level
+    // — a silent downgrade of containment. Every other setup failure in this
+    // function already fails closed; this one must too. Refuse to detonate
+    // rather than run a sample without low integrity.
+    let low_integrity_result = set_low_integrity(restricted_token);
+    if !may_detonate(low_integrity_result.is_ok()) {
+        unsafe {
+            let _ = CloseHandle(restricted_token);
         }
-    };
+        errors.push(format!(
+            "Low integrity failed: {} — FAIL CLOSED, no detonation (SR-02)",
+            low_integrity_result.err().unwrap_or_default()
+        ));
+        return failed_launch(errors);
+    }
+    let low_integrity = true;
 
     // Create process suspended with restricted token.
     // Quote the command line: with a NULL lpApplicationName, CreateProcess*
@@ -237,6 +249,16 @@ fn set_low_integrity(token: HANDLE) -> Result<(), String> {
     }
 }
 
+/// SR-02 containment policy (pure, so it is unit-testable — a real
+/// `SetTokenInformation` cannot be forced to fail on a valid token in a unit
+/// test). A sample may detonate ONLY if every real containment layer was
+/// established. Low integrity is one of those layers (see the containment
+/// model on [`launch_restricted`]), so its failure must block detonation —
+/// the same fail-closed rule the token-setup steps already follow.
+fn may_detonate(low_integrity_ok: bool) -> bool {
+    low_integrity_ok
+}
+
 /// Fail-closed launch result: no process was created, pid == 0 signals the
 /// caller to report `Blocked` instead of detonating.
 fn failed_launch(errors: Vec<String>) -> RestrictedLaunch {
@@ -279,6 +301,23 @@ mod tests {
     fn to_wide_handles_empty_string() {
         let wide = to_wide("");
         assert_eq!(wide, vec![0u16]);
+    }
+
+    #[test]
+    fn sr02_low_integrity_failure_blocks_detonation() {
+        // SR-02 regression: low integrity is a REAL containment layer, so a
+        // failure to set it must block detonation — NOT continue at the
+        // sandbox's own (SYSTEM-derived) integrity level as v1.0 did.
+        assert!(
+            !may_detonate(false),
+            "low-integrity failure must FAIL CLOSED — no detonation (SR-02)"
+        );
+        // Counter-case: when low integrity IS established, detonation proceeds
+        // (closing the hole must not block the legitimate isolated launch).
+        assert!(
+            may_detonate(true),
+            "a fully-contained launch must still be allowed to detonate"
+        );
     }
 
     #[test]
