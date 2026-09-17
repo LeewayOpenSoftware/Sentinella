@@ -15,9 +15,13 @@
 //!     distinguishes two failure classes ([`ResolveOutcome`]):
 //!       - `Unresolved` — we could not even obtain the client PID, or a
 //!         token query on the live, already-opened process failed. Treated
-//!         as a transient API quirk: the caller fails **open** (allow +
-//!         warn), because an OS hiccup must never brick the GUI↔daemon
-//!         channel (WORKING_STATE "DO NOT BREAK" invariant).
+//!         as a transient API quirk: the *connection* fails **open** (allow
+//!         + warn) so an OS hiccup never bricks the GUI↔daemon channel
+//!         (WORKING_STATE "DO NOT BREAK" invariant). NOTE (SR-03): the
+//!         connection fails open for reads, but the per-method
+//!         privileged-mutation gate ([`require_elevation`]) fails **closed**
+//!         for an unresolved identity — an OS quirk must not become an
+//!         authorization for kill-vector methods.
 //!       - `ClientGone` — we got the client PID but cannot open the
 //!         process/token, i.e. the client already exited. The caller fails
 //!         **closed**: a legit GUI is long-lived, and serving a connection
@@ -133,20 +137,32 @@ pub fn decide(id: &ClientIdentity, active_console: Option<u32>) -> Decision {
 /// This function is the daemon-side gate that closes that hole.
 /// Returns Allow only if the caller is elevated or SYSTEM.
 ///
-/// Fail-open behaviour on `None`: if pipe-identity resolution failed
-/// transiently at connect time (`resolve_client` reported
-/// [`ResolveOutcome::Unresolved`] and the WORKING_STATE invariant kept the
-/// connection alive), we still allow — punishing a legitimate elevated GUI
-/// for an OS API quirk would brick the only way the user has to manage the
-/// daemon. A *vanished* client never reaches this point: it is denied at
-/// the connection gate. The Deny path here is for *positively-resolved*
-/// unelevated callers only.
+/// SR-03 (fail-open closed): behaviour on `None`. `None` means the
+/// caller's identity was NOT positively resolved — either a transient
+/// token-query quirk ([`ResolveOutcome::Unresolved`], connection kept
+/// alive for reads) or the debug kill-switch forwarding no identity. The
+/// v0.1.9 code failed **open** here (allowed the mutation), which meant an
+/// unresolved caller could disable realtime / blank `realtime_roots` /
+/// reload sources without any proof of elevation. That is the hole.
+///
+/// This gate now fails **CLOSED** on `None`: a privileged-mutation method
+/// requires a *positively-resolved elevated or SYSTEM* caller. Fail-open is
+/// still correct at the *connection* level (an OS quirk must not brick the
+/// GUI↔daemon channel — reads and status polling keep working with a `None`
+/// identity), but a kill-vector mutation must never proceed without a
+/// resolved elevated identity. What breaks: on the rare hardware where a
+/// token query transiently fails, or when the SID-check kill-switch is set,
+/// the elevated GUI must reconnect (or clear the kill-switch) to perform a
+/// privileged mutation; reads are unaffected. Missing one privileged
+/// mutation on a reconnectable channel is strictly safer than authorizing
+/// an unproven caller to disable protection.
 pub fn require_elevation(id: Option<&ClientIdentity>) -> Decision {
     match id {
         Some(i) if i.well_known_untrusted => Decision::Deny("anonymous/null SID"),
         Some(i) if i.is_system || i.is_elevated => Decision::Allow,
         Some(_) => Decision::Deny("kill-vector method requires elevated caller"),
-        None => Decision::Allow, // pipe identity unresolved → fail-open
+        // SR-03: unresolved identity must NOT authorize privileged mutations.
+        None => Decision::Deny("kill-vector method requires a resolved elevated caller"),
     }
 }
 
@@ -213,7 +229,7 @@ fn decide_pipe_auth(outcome: ResolveOutcome, active_console: Option<u32>) -> Pip
         }
         ResolveOutcome::Unresolved => {
             tracing::warn!(
-                "IPC: could not resolve pipe client identity — allowing (fail-open), elevation gates will also fail-open for this connection"
+                "IPC: could not resolve pipe client identity — allowing connection (fail-open for reads); privileged-mutation gates will fail CLOSED for this connection (SR-03)"
             );
             PipeAuth::Allow { identity: None }
         }
@@ -516,13 +532,37 @@ mod tests {
     }
 
     #[test]
-    fn require_elevation_fails_open_on_unresolved_identity() {
-        // OS API quirk swallowed the peer identity at connect time.
-        // We can't punish a legitimate elevated GUI for that — the
-        // alternative is bricking the GUI↔daemon channel on hardware
-        // where some token call misbehaves. Fail-open here matches the
-        // WORKING_STATE invariant the rest of the module already follows.
-        assert_eq!(require_elevation(None), Decision::Allow);
+    fn require_elevation_denies_unresolved_identity() {
+        // SR-03 regression: an unresolved peer identity (OS token quirk, or
+        // the debug SID-check kill-switch) must NOT authorize a kill-vector
+        // mutation. v0.1.9 failed OPEN here (Decision::Allow), which let an
+        // unproven caller disable protection. It must now DENY. The
+        // connection itself still fails open for reads (see
+        // `unresolved_identity_still_fails_open`); only the privileged-
+        // mutation gate closes.
+        match require_elevation(None) {
+            Decision::Deny(_) => {} // expected: fail closed
+            Decision::Allow => panic!(
+                "unresolved identity must be DENIED for privileged mutations \
+                 (SR-03); allowing it is the fail-open hole"
+            ),
+        }
+    }
+
+    #[test]
+    fn require_elevation_legitimate_elevated_path_still_authorizes() {
+        // SR-03 counter-test god required: proving Deny alone is not enough —
+        // we must confirm the legitimate flow STILL works after closing the
+        // hole. A positively-resolved elevated admin (and SYSTEM) must keep
+        // authorizing privileged mutations, exactly as before.
+        let elevated_admin = id("S-1-5-21-1-2-3-1001", 1, true);
+        let system = id("S-1-5-18", 0, false);
+        assert_eq!(
+            require_elevation(Some(&elevated_admin)),
+            Decision::Allow,
+            "closing SR-03 must not break the legitimate elevated GUI"
+        );
+        assert_eq!(require_elevation(Some(&system)), Decision::Allow);
     }
 
     // ── Dead-PID race regression (audit HIGH) ──

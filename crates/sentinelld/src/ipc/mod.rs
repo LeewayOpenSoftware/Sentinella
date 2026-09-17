@@ -269,8 +269,12 @@ impl Server {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
                 if bypass {
-                    // Kill-switch active — also disables the v0.1.9 elevation
-                    // gate by forwarding `None` identity, which fails-open.
+                    // Kill-switch active — forwards `None` identity. SR-03:
+                    // `require_elevation(None)` now fails CLOSED, so with the
+                    // kill-switch set the connection still serves reads but
+                    // privileged-mutation methods are denied (no resolved
+                    // elevated identity to authorize them). Clear the
+                    // kill-switch to perform kill-vector mutations.
                     peer_identity = None;
                 } else {
                     match client_auth::authorize_and_resolve_pipe_client(
@@ -1381,10 +1385,11 @@ fn dispatch_sync(
     //
     // Fix: every method on `is_challengeable_method`'s allowlist also
     // requires the caller's process token to be elevated or SYSTEM.
-    // Fail-open on unresolved identity (None peer) preserves the
-    // WORKING_STATE invariant that an OS API quirk on a legit elevated
-    // GUI doesn't brick the channel — only positively-resolved
-    // unelevated callers are rejected.
+    // SR-03: an unresolved identity (None peer) now fails CLOSED here —
+    // a privileged mutation requires a positively-resolved elevated
+    // caller. The connection still fails open for reads, so an OS quirk
+    // never bricks the channel; it just can't authorize a kill-vector
+    // method without proof of elevation.
     if is_challengeable_method(&req.method) {
         if let client_auth::Decision::Deny(reason) =
             client_auth::require_elevation(peer)
