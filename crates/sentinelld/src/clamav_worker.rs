@@ -51,18 +51,63 @@ pub struct ClamWorkerOutput {
     pub scan_time_ms: u64,
 }
 
+/// Why an isolated worker scan produced no verdict. Typed (SR-01) so the
+/// caller can apply the isolation policy WITHOUT fragile substring matching:
+/// only [`WorkerError::Failed`] is a genuine subprocess failure; `Cancelled`
+/// and `Busy` must never be treated as one.
+#[derive(Debug)]
+pub enum WorkerError {
+    /// The user cancelled (the cancel flag was observed). NOT a failure and
+    /// must NEVER trigger an in-process fallback — that would both defeat the
+    /// cancellation and re-scan the file the user asked to stop.
+    Cancelled,
+    /// Concurrency limit reached (`MAX_CONCURRENT_WORKERS`) — a deliberate
+    /// load-shed, not a crash. There is simply no isolated capacity right now,
+    /// so the caller falls back to in-process. (This leaves a residual
+    /// isolation gap under sustained load; see the SR-01 report.)
+    Busy,
+    /// Genuine subprocess failure: spawn/timeout/protocol/crash. With
+    /// `clamav_isolation=subprocess` this must FAIL CLOSED — the caller must
+    /// NOT scan the (possibly-malicious) file in-process in the privileged
+    /// daemon (SR-01).
+    Failed(String),
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerError::Cancelled => write!(f, "cancelled"),
+            WorkerError::Busy => write!(f, "clamavd concurrency limit reached"),
+            WorkerError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<String> for WorkerError {
+    fn from(s: String) -> Self {
+        WorkerError::Failed(s)
+    }
+}
+
+impl From<&str> for WorkerError {
+    fn from(s: &str) -> Self {
+        WorkerError::Failed(s.to_string())
+    }
+}
+
 /// Scan a file using the isolated clamavd subprocess.
 /// Limits concurrent workers to MAX_CONCURRENT_WORKERS to prevent RAM explosion.
 pub fn scan_file(
     settings: &ClamWorkerSettings,
     path: &Path,
     cancel: &AtomicBool,
-) -> Result<ClamWorkerOutput, String> {
+) -> Result<ClamWorkerOutput, WorkerError> {
     // Concurrency gate — each clamavd loads ~400MB of signatures.
     let active = ACTIVE_WORKERS.fetch_add(1, Ordering::Relaxed);
     if active >= MAX_CONCURRENT_WORKERS {
         ACTIVE_WORKERS.fetch_sub(1, Ordering::Relaxed);
-        return Err("clamavd concurrency limit reached — falling back to in-process".into());
+        // Load-shed, not a failure: the caller may fall back to in-process.
+        return Err(WorkerError::Busy);
     }
     let _guard = scopeguard(|| {
         ACTIVE_WORKERS.fetch_sub(1, Ordering::Relaxed);
@@ -109,15 +154,15 @@ pub fn scan_file(
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("cancelled".into());
+            return Err(WorkerError::Cancelled);
         }
         if start.elapsed() > settings.timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
+            return Err(WorkerError::Failed(format!(
                 "clamavd timeout after {}s",
                 settings.timeout.as_secs()
-            ));
+            )));
         }
         match child.try_wait() {
             Ok(Some(_status)) => break,
@@ -125,7 +170,7 @@ pub fn scan_file(
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("clamavd wait error: {e}"));
+                return Err(WorkerError::Failed(format!("clamavd wait error: {e}")));
             }
         }
     }
@@ -151,10 +196,10 @@ pub fn scan_file(
     // must be the file we asked to scan. clamavd echoes the CLI arg verbatim.
     let want = path.to_string_lossy();
     if !output.path.trim().eq_ignore_ascii_case(&want) {
-        return Err(format!(
+        return Err(WorkerError::Failed(format!(
             "clamavd JSON path mismatch: reported {}, requested {want}",
             output.path.trim()
-        ));
+        )));
     }
 
     Ok(output)

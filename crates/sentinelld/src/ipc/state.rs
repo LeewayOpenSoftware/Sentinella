@@ -884,6 +884,43 @@ fn cancel_transition(previous: ScanJobStatus) -> Option<ScanJobStatus> {
     }
 }
 
+/// SR-01 isolation policy: whether an isolated (`clamav_isolation=subprocess`)
+/// scan may fall back to the in-process engine after the worker did not
+/// return a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClamFallback {
+    /// Do NOT scan in-process — return a cancelled/errored result instead.
+    Refuse,
+    /// Fall back to the in-process engine (only the concurrency load-shed).
+    InProcess,
+}
+
+/// Pure SR-01 fallback decision, split out for unit testing (the real path
+/// needs a live clamavd, so the *policy* is tested here without one).
+///
+/// - A user cancellation (`cancelled` flag set, or a typed `Cancelled`) never
+///   falls back: that would defeat the cancellation and re-scan the file the
+///   user asked to stop.
+/// - `Busy` (concurrency limit) is a deliberate load-shed, not a failure —
+///   there is simply no isolated capacity, so in-process is permitted.
+/// - `Failed` is a genuine subprocess failure: falling back would scan a
+///   possibly-malicious file in the privileged daemon, defeating the very
+///   isolation the operator configured. Fail CLOSED.
+fn clamav_fallback_decision(
+    err: &crate::clamav_worker::WorkerError,
+    cancelled: bool,
+) -> ClamFallback {
+    use crate::clamav_worker::WorkerError;
+    if cancelled {
+        return ClamFallback::Refuse;
+    }
+    match err {
+        WorkerError::Cancelled => ClamFallback::Refuse,
+        WorkerError::Busy => ClamFallback::InProcess,
+        WorkerError::Failed(_) => ClamFallback::Refuse,
+    }
+}
+
 impl AppState {
     /// v0.1.9 Phase 2 — guard for the config read-modify-write window.
     /// IPC handlers that mutate `sentinelld.toml` must wrap their entire
@@ -1451,22 +1488,49 @@ impl AppState {
                                 error: output.error,
                             };
                         }
-                        Err(e) if e.contains("cancelled") => {
-                            return crate::engine::clamav::ScanResult {
-                                path: path.to_string_lossy().to_string(),
-                                infected: false,
-                                virus_name: None,
-                                scanned_bytes: 0,
-                                error: Some(e),
-                            };
-                        }
+                        // SR-01: the crash-vs-cancel conflation is gone. The
+                        // worker now returns a TYPED error, and the pure
+                        // `clamav_fallback_decision` policy (unit-tested) says
+                        // whether an in-process fallback is permitted. Only the
+                        // concurrency load-shed (`Busy`) may fall back; a user
+                        // cancellation and a genuine subprocess failure must
+                        // NOT scan the file in-process (that would defeat the
+                        // isolation boundary the operator configured, or re-run
+                        // the scan the user asked to stop).
                         Err(e) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "clamavd subprocess failed — falling back to in-process"
-                            );
-                            // Fall through to in-process.
+                            let cancelled = cancel.load(Ordering::Relaxed);
+                            match clamav_fallback_decision(&e, cancelled) {
+                                ClamFallback::InProcess => {
+                                    tracing::debug!(
+                                        path = %path.display(),
+                                        "clamavd at concurrency limit — in-process fallback (load-shed, not a failure)"
+                                    );
+                                    // Fall through to in-process.
+                                }
+                                ClamFallback::Refuse => {
+                                    let error = if cancelled
+                                        || matches!(&e, crate::clamav_worker::WorkerError::Cancelled)
+                                    {
+                                        "cancelled".to_string()
+                                    } else {
+                                        tracing::warn!(
+                                            path = %path.display(),
+                                            error = %e,
+                                            "clamavd subprocess failed — isolation enforced, NOT falling back to in-process (SR-01)"
+                                        );
+                                        format!(
+                                            "clamavd subprocess failed and clamav_isolation=subprocess forbids in-process fallback: {e}"
+                                        )
+                                    };
+                                    return crate::engine::clamav::ScanResult {
+                                        path: path.to_string_lossy().to_string(),
+                                        infected: false,
+                                        virus_name: None,
+                                        scanned_bytes: 0,
+                                        error: Some(error),
+                                    };
+                                }
+                            }
                         }
                     }
                 }
@@ -7432,6 +7496,64 @@ mod tests {
     // moves a finished job out of Draining (the workers that write terminal
     // states are gone), so one unlucky cancel click landing exactly at scan
     // completion bricked every future scan.start until daemon restart.
+    // ── SR-01: clamavd subprocess-failure fallback must fail CLOSED ──
+    //
+    // The bug: on any clamavd worker error the scan silently fell back to
+    // `engine.scan_file()`, scanning a possibly-malicious file IN-PROCESS in
+    // the SYSTEM daemon — dropping the isolation boundary the operator asked
+    // for with clamav_isolation=subprocess. And user cancellation shared that
+    // same error path, so a cancel could re-scan the file the user stopped.
+    #[test]
+    fn sr01_genuine_failure_does_not_fall_back_to_in_process() {
+        use crate::clamav_worker::WorkerError;
+        // A real subprocess failure (spawn/timeout/protocol/crash) must NOT
+        // fall back — isolation stays enforced, the scan is reported errored.
+        assert_eq!(
+            clamav_fallback_decision(&WorkerError::Failed("clamavd timeout".into()), false),
+            ClamFallback::Refuse,
+            "a clamavd failure must fail CLOSED, never scan in-process (SR-01)"
+        );
+    }
+
+    #[test]
+    fn sr01_cancellation_never_falls_back() {
+        use crate::clamav_worker::WorkerError;
+        // Typed cancel from the worker: refuse.
+        assert_eq!(
+            clamav_fallback_decision(&WorkerError::Cancelled, false),
+            ClamFallback::Refuse,
+            "cancellation must never fall back to in-process (SR-01 restriction)"
+        );
+        // Even if the worker reported a generic Failed, a set cancel flag
+        // (cancel raced in after the worker's own check) must still be treated
+        // as a cancellation, never a fallback.
+        assert_eq!(
+            clamav_fallback_decision(&WorkerError::Failed("wait error".into()), true),
+            ClamFallback::Refuse,
+            "a cancel that races in must not become an in-process fallback"
+        );
+    }
+
+    #[test]
+    fn sr01_concurrency_loadshed_still_falls_back() {
+        use crate::clamav_worker::WorkerError;
+        // The counter-case: the concurrency limit is a deliberate load-shed,
+        // NOT a failure. It must STILL fall back to in-process so closing the
+        // failure hole does not break the frequent legitimate load flow
+        // (MAX_CONCURRENT_WORKERS is only 2). If a cancel is also pending,
+        // cancellation wins (refuse).
+        assert_eq!(
+            clamav_fallback_decision(&WorkerError::Busy, false),
+            ClamFallback::InProcess,
+            "concurrency load-shed must keep the in-process fallback"
+        );
+        assert_eq!(
+            clamav_fallback_decision(&WorkerError::Busy, true),
+            ClamFallback::Refuse,
+            "a pending cancel overrides even the load-shed fallback"
+        );
+    }
+
     #[test]
     fn cancel_transition_refuses_terminal_states() {
         // Only Pending/Running may transition.
