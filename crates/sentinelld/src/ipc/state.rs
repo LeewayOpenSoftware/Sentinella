@@ -56,6 +56,71 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 static ENGINE_RELOAD_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// ── AMSI provider observability (Track F) ───────────────────────────
+// Counters for scan requests that arrive via the AMSI provider path
+// (origin=="amsi" on runtime.scan_buffer). Module statics rather than
+// AppState fields: a single global count is all this needs and it keeps
+// the change contained. The point is ATTRIBUTION — proving a block came
+// from OUR provider and not from another registered AMSI provider such as
+// Defender, which the DLL-loads-fine check alone cannot show.
+static AMSI_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static AMSI_BLOCKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static AMSI_LAST_SEEN_UNIX: AtomicI64 = AtomicI64::new(0);
+
+/// Record one AMSI-path scan. Called from the `runtime.scan_buffer` handler
+/// only when the request declares `origin == "amsi"`; `blocked` mirrors the
+/// verdict returned to the host.
+pub(crate) fn record_amsi_scan(blocked: bool) {
+    AMSI_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if blocked {
+        AMSI_BLOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    AMSI_LAST_SEEN_UNIX.store(now, Ordering::Relaxed);
+}
+
+/// Read-only probe: is our AMSI provider CLSID enrolled under
+/// `HKLM\SOFTWARE\Microsoft\AMSI\Providers`? Opening the key read-only is a
+/// pure query and never writes. Keep the CLSID in sync with
+/// `crates/amsi_provider/src/registration.rs`.
+#[cfg(windows)]
+fn amsi_provider_registered() -> bool {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+    use windows::core::PCWSTR;
+    const SUBKEY: &str =
+        r"SOFTWARE\Microsoft\AMSI\Providers\{53E6920C-21B6-4826-9752-81485B3CBA2A}";
+    let wide: Vec<u16> = SUBKEY.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey = HKEY(std::ptr::null_mut());
+    // SAFETY: read-only open of a fixed subkey; the handle is closed on success.
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if rc.0 == 0 {
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn amsi_provider_registered() -> bool {
+    false
+}
+
 /// Get max file size from config (or default).
 fn max_file_size() -> u64 {
     crate::config::Config::load(None)
@@ -4999,12 +5064,30 @@ impl AppState {
             })
         };
 
+        let amsi_registered = amsi_provider_registered();
+        let amsi_note = if amsi_registered {
+            "AMSI provider registered; requests_total counts scans that reached \
+             the daemon via the provider path, which attributes a block to us \
+             rather than to another registered AMSI provider"
+        } else {
+            "AMSI provider DLL is built but its CLSID is not enrolled under \
+             HKLM AMSI\\Providers on this machine"
+        };
+
         serde_json::json!({
             "plm": plm_diag,
             "powershell": ps_diag,
             "trust_graph": trust_diag,
             "ecosystem": self.ecosystem.diagnostics(),
-            "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
+            "amsi": {
+                "enabled": amsi_registered,
+                "registered": amsi_registered,
+                "clsid": "{53E6920C-21B6-4826-9752-81485B3CBA2A}",
+                "requests_total": AMSI_REQUESTS_TOTAL.load(Ordering::Relaxed),
+                "blocks_total": AMSI_BLOCKS_TOTAL.load(Ordering::Relaxed),
+                "last_seen_unix": AMSI_LAST_SEEN_UNIX.load(Ordering::Relaxed),
+                "note": amsi_note,
+            },
             "weedhack_campaigns": weedhack_diag,
         })
     }

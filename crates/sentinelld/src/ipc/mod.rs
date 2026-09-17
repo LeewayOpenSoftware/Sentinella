@@ -1997,9 +1997,17 @@ fn dispatch_sync(
             if content.is_empty() {
                 Ok(serde_json::json!({"ok": false, "error": "empty content"}))
             } else {
+                // Optional: the AMSI provider passes the host PID so the
+                // PLM lineage boost below (previously dead, source_pid was
+                // hardcoded 0) can correlate the script with its process.
+                let source_pid = req
+                    .params
+                    .get("source_pid")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 let buffer = crate::amsi::RuntimeBuffer {
                     source_app: source_app.to_string(),
-                    source_pid: 0,
+                    source_pid,
                     content_name: content_name.to_string(),
                     language: crate::amsi::ScriptLanguage::from_app_name(&format!(
                         "{language}.exe"
@@ -2024,6 +2032,13 @@ fn dispatch_sync(
                 };
 
                 let total_score = result.score.saturating_add(plm_boost).min(100);
+
+                // Observability: count scans that came through the AMSI
+                // provider (origin=="amsi") so a block can be attributed to
+                // our provider vs. another registered one (e.g. Defender).
+                if req.params.get("origin").and_then(|v| v.as_str()) == Some("amsi") {
+                    crate::ipc::state::record_amsi_scan(result.should_block);
+                }
 
                 Ok(serde_json::json!({
                     "ok": true,

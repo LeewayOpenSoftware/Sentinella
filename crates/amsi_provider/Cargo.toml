@@ -1,0 +1,33 @@
+[package]
+name = "amsi_provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# cdylib -> the in-process AMSI provider DLL (sentinella_amsi_provider.dll,
+#           exports DllGetClassObject / DllRegisterServer / ...).
+# rlib   -> lets `cargo test` link and exercise the pure logic (verdict
+#           mapping, timeout fail-open, request/response framing,
+#           registration strings) without loading COM.
+name = "sentinella_amsi_provider"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = { workspace = true }
+sentinella-common = { path = "../sentinella-common" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.61"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Antimalware",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+] }
