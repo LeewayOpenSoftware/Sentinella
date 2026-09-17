@@ -184,6 +184,35 @@ export function notifyRealtimeUnavailable(): void {
   recordNotification("realtime_unavailable", t("notify.realtime_unavailable"));
 }
 
+/**
+ * Web protection's watchdog removed the DNS filtering rule because the
+ * proxy stopped answering reliably — the machine's DNS reverted to
+ * normal (unfiltered) resolution. Same gate/severity/dedupe pattern as
+ * `notifyRealtimeUnavailable`: this is the DNS-filtering equivalent of
+ * the file watcher going down.
+ */
+export function notifyWebProtectionUnavailable(): void {
+  if (!shouldNotify("onDegraded", "critical")) return;
+  if (!dedupeCheck("web_protection_unavailable")) return;
+
+  send(t("notify.web_protection_unavailable"), t("notify.body_web_protection_unavailable"));
+  recordNotification("web_protection_unavailable", t("notify.web_protection_unavailable"));
+}
+
+/**
+ * One or more DNS servers used by web protection stopped responding.
+ * Filtering itself is still active — this is a partial degradation, not
+ * a loss of protection — so it is a lower severity than
+ * `notifyWebProtectionUnavailable`.
+ */
+export function notifyWebProtectionDegraded(): void {
+  if (!shouldNotify("onDegraded", "warning")) return;
+  if (!dedupeCheck("web_protection_degraded")) return;
+
+  send(t("notify.web_protection_degraded"), t("notify.body_web_protection_degraded"));
+  recordNotification("web_protection_degraded", t("notify.web_protection_degraded"));
+}
+
 /** First-run signature update completed. */
 export function notifyFirstRunUpdateComplete(sigCount: number): void {
   if (!loadNotificationSettings().enabled) return;

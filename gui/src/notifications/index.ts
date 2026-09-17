@@ -6,6 +6,8 @@ export {
   notifySignaturesStale,
   notifyProtectionDegraded,
   notifyRealtimeUnavailable,
+  notifyWebProtectionUnavailable,
+  notifyWebProtectionDegraded,
   notifyFirstRunUpdateComplete,
   notifyFirstRunUpdateFailed,
 } from "./notify";

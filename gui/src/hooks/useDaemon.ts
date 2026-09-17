@@ -6,6 +6,8 @@ import {
   notifySignaturesStale,
   notifyProtectionDegraded,
   notifyRealtimeUnavailable,
+  notifyWebProtectionUnavailable,
+  notifyWebProtectionDegraded,
   notifyQuarantined,
 } from "../notifications";
 // v0.1.9 audit HIGH-3 fix: invalidate the Settings page's module-scope
@@ -90,6 +92,15 @@ export function useDaemon(): DaemonState {
     dbStaleNotify: boolean;
     protectionState: string;
     watcherActive: boolean;
+    /**
+     * The daemon's `disabled()` status shape always carries
+     * `watchdog_fired: false` (there is no watchdog running to have fired),
+     * so these are already naturally `false` on every poll where the
+     * feature is off — no separate "was it enabled last time" guard is
+     * needed; plain edge-detection below is enough, same as `watcherActive`.
+     */
+    webProtectionWatchdogFired: boolean;
+    webProtectionUpstreamsDegraded: boolean;
     /**
      * False until `quarantineIds` was built from a quarantine.list we could
      * actually trust. The notification loop refuses to diff against an
@@ -229,6 +240,19 @@ export function useDaemon(): DaemonState {
           notifyRealtimeUnavailable();
         }
 
+        // Web protection's watchdog fired (rule removed, DNS reverted to
+        // normal) or an upstream degraded — same false→true edge-detection
+        // pattern as the watcher check above.
+        const wp = result.webProtection;
+        if (!prev.webProtectionWatchdogFired && wp.watchdog_fired) {
+          notifyWebProtectionUnavailable();
+        } else if (!prev.webProtectionUpstreamsDegraded && (wp.upstreams_degraded?.length ?? 0) > 0) {
+          // else-if: a fired watchdog already implies degraded upstreams
+          // in most real cases and is the more severe fact — one toast,
+          // not two, for the same underlying event.
+          notifyWebProtectionDegraded();
+        }
+
         // New quarantine items (watcher auto-quarantine). Two guards:
         //  - `quarantineSeeded`: never diff against a baseline that was itself
         //    built from a failed quarantine.list. Without it, one transient
@@ -272,6 +296,8 @@ export function useDaemon(): DaemonState {
           dbStaleNotify: result.stats.db_stale_notify ?? false,
           protectionState: result.stats.protection_state,
           watcherActive: result.stats.watcher_active,
+          webProtectionWatchdogFired: result.webProtection.watchdog_fired ?? false,
+          webProtectionUpstreamsDegraded: (result.webProtection.upstreams_degraded?.length ?? 0) > 0,
           // Latches once the list has been seen for real. The rest of the
           // snapshot still seeds on this poll, so a permanently-failing
           // quarantine.list only silences quarantine toasts — scan/protection
